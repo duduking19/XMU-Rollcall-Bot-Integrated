@@ -183,6 +183,7 @@ def get_qr_config(config=None):
         "ngrok_token": token_env or qr_config.get("ngrok_token") or "",
         "session_timeout": _parse_int(timeout_env, _parse_int(qr_config.get("session_timeout"), 180)),
         "flask_port": _parse_int(port_env, _parse_int(qr_config.get("flask_port"), 5001)),
+        "public_base_url": _env_value("XMU_ROLLCALL_QR_PUBLIC_BASE_URL") or qr_config.get("public_base_url") or "",
     }
 
 def get_notification_config(config=None):

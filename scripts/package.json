@@ -1,0 +1,16 @@
+{
+  "name": "xmu-scanner-browser-tests",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test_scanner_browser.cjs",
+    "preview": "node make_preview.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0",
+    "pngjs": "7.0.0",
+    "qrcode": "1.5.4"
+  }
+}

@@ -7,7 +7,7 @@ from xmulogin import xmulogin
 
 from .config import get_cookies_path
 from .monitor import base_url, headers, interval
-from .rollcall_handler import process_rollcalls
+from .rollcall_handler import process_rollcalls, refresh_pending_qr
 from .utils import load_session, save_session, verify_session
 
 
@@ -161,6 +161,8 @@ class MultiAccountMonitor:
                     if rollcalls:
                         self.log(f"[{label}] New rollcall(s) found: {len(rollcalls)}")
                         temp_data = process_rollcalls(temp_data, session, account=account)
+                else:
+                    refresh_pending_qr(data, session, account=account)
             except Exception as exc:
                 self.log(f"[{label}] Poll failed: {exc}")
                 next_poll = time.monotonic() + max(self.poll_interval, 5)

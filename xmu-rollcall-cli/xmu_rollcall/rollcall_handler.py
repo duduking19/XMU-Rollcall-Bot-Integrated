@@ -85,7 +85,10 @@ def handle_rollcalls(data, session, account=None):
                 else:
                     print("Answering failed.")
             else:
-                if handle_qr_rollcall(session, rollcalls[i]):
+                qr_result = handle_qr_rollcall(session, rollcalls[i])
+                if qr_result is None:
+                    answer_status[i] = True  # Async scan pending; keep polling.
+                elif qr_result:
                     answer_status[i] = True
                     _notify_success(notifier, rollcalls[i], "QRcode")
                 else:
@@ -97,3 +100,12 @@ def _notify_success(notifier, rollcall, rollcall_type):
     result = notifier.send_rollcall_success(rollcall, rollcall_type)
     if not result.ok:
         print(f"[Notification] Success feedback failed: {result.message}")
+
+
+def refresh_pending_qr(data, session, account=None):
+    """Renew expired scan links without retrying unrelated number/radar rollcalls."""
+    _, rollcalls = extract_rollcalls(data, account=account)
+    for rollcall in rollcalls:
+        if (not rollcall["is_radar"] and not rollcall["is_number"] and
+                not rollcall["is_expired"] and rollcall["status"] == "absent"):
+            handle_qr_rollcall(session, rollcall)

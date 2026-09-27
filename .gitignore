@@ -8,3 +8,10 @@ __pycache__/
 .DS_Store
 .xmu_rollcall/
 *.log
+
+/artifacts/
+/scripts/node_modules/
+*.egg-info/
+.pytest_cache/
+/build/
+/dist/

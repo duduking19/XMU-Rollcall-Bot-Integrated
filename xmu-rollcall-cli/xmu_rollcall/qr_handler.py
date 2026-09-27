@@ -1,8 +1,8 @@
 import json
+import re
 import threading
 import time
 import uuid
-from queue import Empty
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -136,6 +136,10 @@ def parse_qr_code_text(text):
         raise QRParseError("QR code payload does not contain rollcallId")
     if "data" not in data:
         raise QRParseError("QR code payload does not contain data")
+    if isinstance(data["rollcallId"], bool) or not re.fullmatch(r"[0-9]{1,20}", str(data["rollcallId"])):
+        raise QRParseError("invalid rollcallId")
+    if not isinstance(data["data"], str) or not 1 <= len(data["data"]) <= 4096:
+        raise QRParseError("invalid QR token")
     return data
 
 
@@ -157,6 +161,8 @@ def _parse_qr_url_or_payload(text):
     except Exception as exc:
         raise QRParseError(f"invalid QR code URL: {exc}") from exc
 
+    if parsed_url.scheme != "https" or parsed_url.hostname != "lnt.xmu.edu.cn" or parsed_url.username or parsed_url.port not in (None, 443):
+        raise QRParseError("unsupported QR code origin")
     if parsed_url.path not in {"/j", "/scanner-jumper"}:
         raise QRParseError("unsupported QR code URL path")
 
@@ -173,94 +179,89 @@ def _parse_qr_url_or_payload(text):
 
 
 def handle_qr_rollcall(session, rollcall):
+    """Schedule once, then return immediately so account polling can continue."""
     config_data = load_config()
     qr_config = get_qr_config(config_data)
-    notifier = build_notifier(config_data)
-
     if not qr_config.get("enabled"):
-        print("[QR] QR rollcall detected, but qr.enabled is not true. Skipping QR flow.")
-        notifier.send(
-            "XMU QR Rollcall skipped",
-            "QR rollcall was detected, but QR support is disabled in local config.",
+        return False
+    notifier = build_notifier(config_data)
+    # A requests.Session must not be shared between the polling thread and workers.
+    cookies = session.cookies.copy()
+    headers = dict(session.headers)
+    notified = False
+
+    def complete(payload, verify_only=False):
+        nonlocal notified
+        with requests.Session() as upstream:
+            upstream.cookies.update(cookies)
+            upstream.headers.update(headers)
+            result = (verify_qr_rollcall(upstream, rollcall["rollcall_id"]) if verify_only else
+                      submit_qr_rollcall(upstream, payload))
+        if result == "success" and not notified:
+            notified = True
+            try:
+                notifier.send_rollcall_success(rollcall, "QRcode")
+            except Exception:
+                # Confirmation already succeeded; notification must not change it.
+                print("[QR] Success notification failed.")
+        return result
+
+    try:
+        scanner = _get_server(qr_config)
+        item = scanner.create_session(
+            qr_config["session_timeout"], rollcall["rollcall_id"], complete,
+            key=(rollcall.get("account_id", "default"), str(rollcall["rollcall_id"])),
         )
+        if scanner.claim_notice(item):
+            result = notifier.send_qr_link(rollcall, item.url, max(1, int(item.expires - time.monotonic())))
+            if result.ok:
+                scanner.notice_delivered(item)
+            else:
+                print("[QR] Scan notification failed; monitoring continues.")
+        return None  # Pending. The worker, not this caller, sends the success notice.
+    except Exception:
+        print("[QR] Could not prepare scanner; monitoring will retry.")
         return False
 
-    if not qr_config.get("ngrok_token"):
-        print("[QR] QR rollcall detected, but ngrok_token is missing. Skipping QR flow.")
-        notifier.send(
-            "XMU QR Rollcall skipped",
-            "QR rollcall was detected, but qr.ngrok_token is missing.",
-        )
-        return False
 
+def verify_qr_rollcall(session, rollcall_id):
+    """Only a matching school attendance record constitutes confirmed success."""
     try:
-        scan_session = _get_server(qr_config).create_session(qr_config["session_timeout"])
-    except Exception as exc:
-        print(f"[QR] Failed to start QR scanner service: {exc}")
-        notifier.send("XMU QR scanner unavailable", str(exc))
-        return False
-
-    print(f"[QR] One-time scanner link: {scan_session.url}")
-    notify_result = notifier.send_qr_link(
-        rollcall,
-        scan_session.url,
-        scan_session.timeout,
-    )
-    if not notify_result.ok:
-        print(f"[QR] Notification failed: {notify_result.message}")
-
-    print(f"[QR] Waiting for scan result for up to {scan_session.timeout} seconds...")
-    try:
-        qr_text = scan_session.queue.get(timeout=scan_session.timeout + 5)
-    except Empty:
-        print("[QR] Timed out waiting for scan result.")
-        return False
-
-    if not qr_text:
-        print("[QR] Scanner session expired before a QR code was submitted.")
-        return False
-
-    try:
-        payload = parse_qr_code_text(qr_text)
-    except Exception as exc:
-        print(f"[QR] Failed to parse submitted QR code: {exc}")
-        return False
-
-    expected_id = str(rollcall.get("rollcall_id"))
-    actual_id = str(payload.get("rollcallId"))
-    if expected_id and actual_id != expected_id:
-        print(f"[QR] Submitted QR rollcallId {actual_id} does not match current rollcall {expected_id}.")
-        return False
-
-    return submit_qr_rollcall(session, payload)
+        response = session.get(f"{base_url}/api/radar/rollcalls", headers=mobile_headers,
+                               timeout=(5, 12), allow_redirects=False)
+        if response.status_code != 200 or "application/json" not in response.headers.get("Content-Type", "").lower():
+            return "uncertain"
+        body = response.json()
+        rows = body.get("rollcalls") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            return "uncertain"
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("rollcall_id")) == str(rollcall_id):
+                if row.get("status") == "on_call_fine":
+                    return "success"
+        return "uncertain"
+    except (requests.RequestException, ValueError):
+        return "uncertain"
 
 
 def submit_qr_rollcall(session, payload):
-    rollcall_id = payload["rollcallId"]
-    answer_url = f"{base_url}/api/rollcall/{rollcall_id}/answer_qr_rollcall"
-    body = {
-        "data": payload["data"],
-        "deviceId": str(uuid.uuid4()),
-    }
-    started_at = time.time()
-
+    """Never automatically repeat a PUT whose outcome is unknown."""
     try:
-        response = session.put(answer_url, headers=mobile_headers, json=body)
-    except requests.RequestException as exc:
-        print(f"[QR] Failed to submit QR rollcall: {exc}")
-        return False
-
-    elapsed = time.time() - started_at
-    if response.status_code == 200:
-        print(f"[QR] QR rollcall answered successfully. Time: {elapsed:.2f} s.")
-        return True
-
-    print(f"[QR] QR rollcall submission failed. HTTP {response.status_code}. Time: {elapsed:.2f} s.")
-    try:
-        print(f"[QR] Server response: {response.json()}")
-    except ValueError:
-        print(f"[QR] Server response: {response.text[:300]}")
-    return False
+        response = session.put(
+            f"{base_url}/api/rollcall/{payload['rollcallId']}/answer_qr_rollcall",
+            headers=mobile_headers, json={"data": payload["data"], "deviceId": str(uuid.uuid4())},
+            timeout=(5, 12), allow_redirects=False,
+        )
+    except requests.RequestException:
+        return verify_qr_rollcall(session, payload["rollcallId"])
+    confirmed = verify_qr_rollcall(session, payload["rollcallId"])
+    if confirmed == "success":
+        return confirmed
+    # A definite rejection can be retried with a fresh code. 2xx, redirects and
+    # server errors may have committed; keep them uncertain until verified.
+    if response.status_code in {400, 401, 403, 404, 409, 410, 422, 429}:
+        return "failed"
+    return "uncertain"
 
 
 def _get_server(qr_config):
@@ -276,6 +277,7 @@ def _get_server(qr_config):
             _server = QRServer(
                 port=qr_config["flask_port"],
                 ngrok_token=qr_config["ngrok_token"],
+                public_base_url=qr_config.get("public_base_url", ""),
             )
     _server.start()
     return _server

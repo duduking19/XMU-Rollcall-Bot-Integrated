@@ -212,6 +212,7 @@ def start():
 
     # 启动监控
     try:
+        _prewarm_qr_server()
         start_monitor(current_account)
     except KeyboardInterrupt:
         click.echo(f"\n{Colors.WARNING}Shutting down...{Colors.ENDC}")
@@ -219,6 +220,21 @@ def start():
     except Exception as e:
         click.echo(f"\n{Colors.FAIL}Error: {str(e)}{Colors.ENDC}")
         sys.exit(1)
+
+def _prewarm_qr_server():
+    import logging
+    from .config import get_qr_config
+    from .qr_handler import _get_server
+    cfg = get_qr_config()
+    if cfg.get("enabled"):
+        # Keep bounded, sanitized scanner events visible in the service journal.
+        logging.basicConfig(level=logging.WARNING)
+        logging.getLogger("xmu_rollcall.qr_server").setLevel(logging.INFO)
+        try:
+            _get_server(cfg)
+        except Exception:
+            click.echo("[QR] Scanner prewarm failed; monitoring will retry when needed.")
+
 
 @cli.command("start-all")
 @click.option("--interval", "poll_interval", default=1.0, show_default=True, type=float, help="Polling interval per account in seconds.")
@@ -242,6 +258,7 @@ def start_all(poll_interval, account_ids):
         click.echo(f"  {account.get('id')}: {account.get('name') or account.get('username')}")
 
     try:
+        _prewarm_qr_server()
         start_multi_account_monitor(accounts, poll_interval=poll_interval)
     except KeyboardInterrupt:
         click.echo(f"\n{Colors.WARNING}Shutting down...{Colors.ENDC}")

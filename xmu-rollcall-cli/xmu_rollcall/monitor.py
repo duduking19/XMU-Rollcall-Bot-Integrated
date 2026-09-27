@@ -7,7 +7,7 @@ import re
 from xmulogin import xmulogin
 from . import __version__
 from .utils import clear_screen, save_session, load_session, verify_session
-from .rollcall_handler import process_rollcalls
+from .rollcall_handler import process_rollcalls, refresh_pending_qr
 from .config import get_cookies_path
 
 base_url = "https://lnt.xmu.edu.cn"
@@ -286,7 +286,7 @@ def start_monitor(account):
                 elapsed = int(current_time - start_time)
                 if elapsed > _last_query_time:
                     _last_query_time = elapsed
-                    data = session.get(rollcalls_url, headers=headers).json()
+                    data = session.get(rollcalls_url, headers=headers, timeout=(5, 12)).json()
                     query_count += 1
 
                     local_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
@@ -312,6 +312,8 @@ def start_monitor(account):
                             except KeyboardInterrupt:
                                 raise
                             print_dashboard(ACCOUNT_NAME, start_time, query_count, 0)
+                    else:
+                        refresh_pending_qr(data, session, account=account)
             except KeyboardInterrupt:
                 raise
             except Exception as e:
