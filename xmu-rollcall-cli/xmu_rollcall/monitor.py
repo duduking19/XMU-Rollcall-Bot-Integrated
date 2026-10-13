@@ -9,6 +9,7 @@ from . import __version__
 from .utils import clear_screen, save_session, load_session, verify_session
 from .rollcall_handler import process_rollcalls, refresh_pending_qr
 from .config import get_cookies_path
+from .attendance_guard import AttendanceGuard
 
 base_url = "https://lnt.xmu.edu.cn"
 interval = 1
@@ -214,6 +215,7 @@ def start_monitor(account):
     # set_location(LATITUDE, LONGITUDE)
 
     cookies_path = get_cookies_path(ACCOUNT_ID)
+    attendance_guard = AttendanceGuard.for_accounts([account])
     rollcalls_url = f"{base_url}/api/radar/rollcalls"
     session = None
 
@@ -286,7 +288,9 @@ def start_monitor(account):
                 elapsed = int(current_time - start_time)
                 if elapsed > _last_query_time:
                     _last_query_time = elapsed
-                    data = session.get(rollcalls_url, headers=headers, timeout=(5, 12)).json()
+                    response = session.get(rollcalls_url, headers=headers, timeout=(5, 12))
+                    response.raise_for_status()
+                    data = response.json()
                     query_count += 1
 
                     local_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
@@ -297,14 +301,15 @@ def start_monitor(account):
                     update_status_line(QUERY_LINE, "Query Count: ", str(query_count), Colors.WARNING)
 
                     if temp_data != data:
-                        temp_data = data
-                        if len(temp_data['rollcalls']) > 0:
+                        if len(data['rollcalls']) > 0:
                             clear_screen()
                             width = get_terminal_width()
                             print(f"\n{Colors.WARNING}{Colors.BOLD}{'!' * width}{Colors.ENDC}")
                             print(center_text(f"{Colors.WARNING}{Colors.BOLD}NEW ROLLCALL DETECTED{Colors.ENDC}"))
                             print(f"{Colors.WARNING}{Colors.BOLD}{'!' * width}{Colors.ENDC}\n")
-                            temp_data = process_rollcalls(temp_data, session, account=account)
+                            temp_data = process_rollcalls(
+                                data, session, account=account, attendance_guard=attendance_guard,
+                            )
                             print_separator("=")
                             print(f"\n{center_text(f'{Colors.GRAY}Press Ctrl+C to exit, continuing monitor...{Colors.ENDC}')}\n")
                             try:
@@ -312,15 +317,18 @@ def start_monitor(account):
                             except KeyboardInterrupt:
                                 raise
                             print_dashboard(ACCOUNT_NAME, start_time, query_count, 0)
+                        else:
+                            temp_data = data
                     else:
                         refresh_pending_qr(data, session, account=account)
             except KeyboardInterrupt:
                 raise
             except Exception as e:
+                temp_data = {'rollcalls': []}
                 clear_screen()
                 print(f"\n{center_text(f'{Colors.FAIL}{Colors.BOLD}Error occurred:{Colors.ENDC} {str(e)}')}")
-                print(f"{center_text(f'{Colors.GRAY}Exiting...{Colors.ENDC}')}\n")
-                sys.exit(1)
+                print(f"{center_text(f'{Colors.GRAY}Retrying...{Colors.ENDC}')}\n")
+                time.sleep(1)
     except KeyboardInterrupt:
         clear_screen()
         print(f"\n{center_text(f'{Colors.WARNING}Shutting down gracefully...{Colors.ENDC}')}")

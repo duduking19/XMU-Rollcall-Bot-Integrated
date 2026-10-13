@@ -61,6 +61,24 @@ When a rollcall is detected, the client handles it in this order:
 
 Successful number, radar, and QR answers all emit a success notification.
 
+## Attendance Threshold
+
+Number and radar submissions require **at least 50% and at least 10 other students**
+to have attended. All complete configured accounts are excluded from both counts,
+including accounts omitted by `--account-id`. Student identities are verified with
+`/api/profile`; an unresolved managed account blocks automatic submission until its
+cached session is valid. Only `on_call` and `on_call_fine` count as attended.
+
+After discovery, `/api/timetable_rollcalls?course_ids=<course_id>&rollcall_date=<yyyy-mm-dd>`
+supplies the attendance roster and number code. Records must match the course ID,
+campus date (UTC+8), and rollcall ID. The old number-code lookup is no longer used.
+Pending rollcalls are checked again each poll, even when discovery data is unchanged.
+Submission proceeds immediately once both thresholds are met, without an extra delay.
+Finished/expired rollcalls are skipped; API failures, missing data, duplicate student
+IDs, and unavailable codes block submission. Counts and allow decisions are never cached.
+Classes with fewer than 10 other students cannot pass the threshold. QR scanning
+and success notifications retain their existing behavior; waiting reasons are logged.
+
 ## Multi-Account Monitoring
 
 Accounts are stored in the same local config file. Add several accounts with:

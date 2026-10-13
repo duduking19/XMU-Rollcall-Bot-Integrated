@@ -6,6 +6,7 @@ import requests
 from xmulogin import xmulogin
 
 from .config import get_cookies_path
+from .attendance_guard import AttendanceGuard
 from .monitor import base_url, headers, interval
 from .rollcall_handler import process_rollcalls, refresh_pending_qr
 from .utils import load_session, save_session, verify_session
@@ -61,6 +62,7 @@ def authenticate_account(account, log=print):
 class MultiAccountMonitor:
     def __init__(self, accounts, poll_interval=interval, stagger=True, log=print):
         self.accounts = [account for account in accounts if is_account_complete(account)]
+        self.attendance_guard = AttendanceGuard.for_accounts(self.accounts)
         self.poll_interval = max(float(poll_interval), 1.0)
         self.stagger = stagger
         self.log = log
@@ -156,14 +158,18 @@ class MultiAccountMonitor:
                 query_count += 1
 
                 if temp_data != data:
-                    temp_data = data
-                    rollcalls = temp_data.get("rollcalls") or []
+                    rollcalls = data.get("rollcalls") or []
                     if rollcalls:
                         self.log(f"[{label}] New rollcall(s) found: {len(rollcalls)}")
-                        temp_data = process_rollcalls(temp_data, session, account=account)
+                        temp_data = process_rollcalls(
+                            data, session, account=account, attendance_guard=self.attendance_guard,
+                        )
+                    else:
+                        temp_data = data
                 else:
                     refresh_pending_qr(data, session, account=account)
             except Exception as exc:
+                temp_data = {"rollcalls": []}
                 self.log(f"[{label}] Poll failed: {exc}")
                 next_poll = time.monotonic() + max(self.poll_interval, 5)
 

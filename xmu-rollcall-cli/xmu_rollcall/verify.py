@@ -1,7 +1,8 @@
 import uuid
-import time
 import math
 import requests
+
+from .attendance_guard import REQUEST_TIMEOUT, valid_number_code
 
 base_url = "https://lnt.xmu.edu.cn"
 headers = {
@@ -15,83 +16,35 @@ headers = {
     "Referer": "https://ids.xmu.edu.cn/authserver/login",
 }
 
-def find_number_code(data, depth=0, max_depth=10):
-    """Extract number_code from nested dict/list API responses.
-
-    Args:
-        data: Parsed JSON payload from Tronclass APIs.
-        depth: Current recursive depth when traversing nested structures.
-        max_depth: Maximum depth allowed for traversal to avoid pathological recursion.
-
-    Returns:
-        str or None: The first discovered number_code value, or None if not found.
-    """
-    if depth > max_depth:
-        return None
-    if isinstance(data, dict):
-        number_code = data.get("number_code")
-        if number_code is not None:
-            return str(number_code)
-        for value in data.values():
-            nested_code = find_number_code(value, depth + 1, max_depth)
-            if nested_code:
-                return nested_code
-    elif isinstance(data, list):
-        for item in data:
-            nested_code = find_number_code(item, depth + 1, max_depth)
-            if nested_code:
-                return nested_code
-    return None
-
-def send_code(in_session, rollcall_id):
-    code_url = f"{base_url}/api/rollcall/{rollcall_id}/student_rollcalls"
+def send_code(in_session, rollcall_id, number_code):
+    """Submit only the exact code selected by the attendance guard."""
+    if not valid_number_code(number_code):
+        print("Number code is unavailable; no answer submitted.")
+        return False
     answer_url = f"{base_url}/api/rollcall/{rollcall_id}/answer_number_rollcall"
-    print("Trying number code from API...")
-    t00 = time.time()
-    request_headers = in_session.headers
+    payload = {"deviceId": str(uuid.uuid4()), "numberCode": number_code}
     try:
-        code_response = in_session.get(code_url, headers=request_headers)
-        if code_response.status_code != 200:
-            t01 = time.time()
-            print(f"Failed to get number code. Status: {code_response.status_code}\nTime: {t01 - t00:.2f} s.")
-            return False
-        code_data = code_response.json()
-    except requests.RequestException as e:
-        t01 = time.time()
-        print(f"Failed to request number code API: {e}\nTime: {t01 - t00:.2f} s.")
-        return False
-    except ValueError as e:
-        t01 = time.time()
-        print(f"Failed to parse number code API response: {e}\nTime: {t01 - t00:.2f} s.")
-        return False
-
-    number_code = find_number_code(code_data)
-    if not number_code:
-        t01 = time.time()
-        print(f"Failed to get number code. 'number_code' not found in API response.\nTime: {t01 - t00:.2f} s.")
-        return False
-
-    payload = {
-        "deviceId": str(uuid.uuid4()),
-        "numberCode": number_code
-    }
-    try:
-        response = in_session.put(answer_url, json=payload, headers=request_headers)
+        response = in_session.put(
+            answer_url, json=payload, headers=in_session.headers, timeout=REQUEST_TIMEOUT,
+        )
         if response.status_code == 200:
-            print("Number code rollcall answered successfully.\nNumber code: ", number_code)
-            time.sleep(5)
-            t01 = time.time()
-            print(f"Time: {t01 - t00:.2f} s.")
+            print("Number code rollcall answered successfully.")
             return True
-        t01 = time.time()
-        print(f"Failed to submit number code. Status: {response.status_code}\nTime: {t01 - t00:.2f} s.")
-        return False
-    except requests.RequestException as e:
-        t01 = time.time()
-        print(f"Failed to submit number code: {e}\nTime: {t01 - t00:.2f} s.")
-        return False
+        print(f"Failed to submit number code. Status: {response.status_code}")
+    except requests.RequestException:
+        print("Failed to submit number code: request failed or timed out.")
+    return False
+
 
 def send_radar(in_session, rollcall_id):
+    try:
+        return _send_radar(in_session, rollcall_id)
+    except (requests.RequestException, ValueError, TypeError, OverflowError, ZeroDivisionError):
+        print("Failed to submit radar answer: invalid response or request failure.")
+        return False
+
+
+def _send_radar(in_session, rollcall_id):
     url = f"{base_url}/api/rollcall/{rollcall_id}/answer"
 
     lat_1, lat_2 = 24.3, 24.6
@@ -109,20 +62,17 @@ def send_radar(in_session, rollcall_id):
             "speed": None
         }
 
-    res_1 = in_session.put(url, json=payload(lat_1, lon_1), headers=headers)
-    data_1 = res_1.json()
-
+    res_1 = in_session.put(url, json=payload(lat_1, lon_1), headers=headers, timeout=REQUEST_TIMEOUT)
     if res_1.status_code == 200:
         return True
+    data_1 = res_1.json()
+    distance_1 = _distance(data_1)
 
-    res_2 = in_session.put(url, json=payload(lat_2, lon_2), headers=headers)
-    data_2 = res_2.json()
-
+    res_2 = in_session.put(url, json=payload(lat_2, lon_2), headers=headers, timeout=REQUEST_TIMEOUT)
     if res_2.status_code == 200:
         return True
-
-    distance_1 = data_1.get("distance")
-    distance_2 = data_2.get("distance")
+    data_2 = res_2.json()
+    distance_2 = _distance(data_2)
 
     def latlon_to_xy(lat, lon, lat0, lon0):
         R = 6371000
@@ -139,11 +89,11 @@ def send_radar(in_session, rollcall_id):
     def circle_intersections(x1, y1, d1, x2, y2, d2):
         D = math.hypot(x2 - x1, y2 - y1)
 
-        if D > d1 + d2 or D < abs(d1 - d2):
+        if D == 0 or D > d1 + d2 or D < abs(d1 - d2):
             return None
 
         a = (d1**2 - d2**2 + D**2) / (2 * D)
-        h = math.sqrt(d1**2 - a**2)
+        h = math.sqrt(max(0.0, d1**2 - a**2))
 
         xm = x1 + a * (x2 - x1) / D
         ym = y1 + a * (y2 - y1) / D
@@ -178,13 +128,21 @@ def send_radar(in_session, rollcall_id):
     payload_1 = payload(sol_x_1, sol_y_1)
     payload_2 = payload(sol_x_2, sol_y_2)
 
-    res_3 = in_session.put(url, json=payload_1, headers=headers)
+    res_3 = in_session.put(url, json=payload_1, headers=headers, timeout=REQUEST_TIMEOUT)
     if res_3.status_code == 200:
         return True
     else:
-        print(res_3.json())
-        res_4 = in_session.put(url, json=payload_2, headers=headers)
+        res_4 = in_session.put(url, json=payload_2, headers=headers, timeout=REQUEST_TIMEOUT)
         if res_4.status_code == 200:
             return True
 
     return False
+
+
+def _distance(data):
+    value = data.get("distance") if isinstance(data, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("missing radar distance")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("invalid radar distance")
+    return value

@@ -9,13 +9,28 @@ A command-line tool for monitoring and auto-answering Tronclass rollcalls at Xia
 - Login with XMU unified authentication through `xmulogin`
 - Continuous rollcall polling (1-second interval)
 - Automatic handling for:
-  - Number rollcalls (fetch number code and answer directly)
-  - Radar rollcalls (location solving)
+  - Number rollcalls (fetch a matching timetable code after the attendance threshold passes)
+  - Radar rollcalls (location solving after the same attendance threshold passes)
 - QR rollcalls through a one-time HTTPS scanner link
 - Notification abstraction with log, Telegram, Feishu, and WeChat support
 - Multi-account management in one local config
 - Multi-account monitoring in one process
 - Session cookie cache and refresh support
+
+## Attendance Threshold
+
+Number and radar rollcalls require **at least 50% and at least 10 other students**
+to have attended. Complete configured accounts are excluded from both counts,
+even if they are not selected for monitoring. Their student IDs must be verified
+using valid cached sessions. `on_call` and `on_call_fine` count as attended.
+
+Attendance and number codes come from `/api/timetable_rollcalls`, matched by course,
+campus date (UTC+8), and rollcall ID. Waiting rollcalls are reevaluated on each poll;
+there is no extra fixed delay once the threshold passes. Finished or expired
+rollcalls are skipped. Missing or malformed data, unverified managed identities,
+and API errors block submission and are retried. Classes with fewer than 10 other
+students do not pass. QR rollcalls keep their existing scanner flow. Logs explain
+waiting decisions; successful answers use the configured notification provider.
 
 ## Installation
 

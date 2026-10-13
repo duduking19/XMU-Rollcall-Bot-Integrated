@@ -3,10 +3,10 @@ from .notifier import build_notifier
 from .qr_handler import handle_qr_rollcall
 from .verify import send_code, send_radar
 
-def process_rollcalls(data, session, account=None):
+def process_rollcalls(data, session, account=None, attendance_guard=None):
     """处理签到数据"""
     data_empty = {'rollcalls': []}
-    result = handle_rollcalls(data, session, account=account)
+    result = handle_rollcalls(data, session, account=account, attendance_guard=attendance_guard)
     if False in result:
         return data_empty
     else:
@@ -27,6 +27,9 @@ def extract_rollcalls(data, account=None):
         for rollcall in rollcalls:
             item = {
                 'course_title': rollcall['course_title'],
+                'course_id': rollcall.get('course_id'),
+                'created_at': rollcall.get('created_at'),
+                'rollcall_time': rollcall.get('rollcall_time'),
                 'created_by_name': rollcall['created_by_name'],
                 'department_name': rollcall['department_name'],
                 'is_expired': rollcall['is_expired'],
@@ -43,7 +46,7 @@ def extract_rollcalls(data, account=None):
         rollcall_count = 0
     return rollcall_count, result
 
-def handle_rollcalls(data, session, account=None):
+def handle_rollcalls(data, session, account=None, attendance_guard=None):
     """处理签到流程"""
     count, rollcalls = extract_rollcalls(data, account=account)
     answer_status = [False for _ in range(count)]
@@ -72,16 +75,26 @@ def handle_rollcalls(data, session, account=None):
             elif rollcalls[i]['status'] != 'absent':
                 print(f"Rollcall status is {rollcalls[i]['status']}; no answer attempt needed.")
                 answer_status[i] = True
-            elif rollcalls[i]['is_radar']:
-                if send_radar(session, rollcalls[i]['rollcall_id']):
+            elif rollcalls[i]['is_radar'] or rollcalls[i]['is_number']:
+                if attendance_guard is None:
+                    print("Attendance guard is unavailable; no answer submitted.")
+                    continue
+                decision = attendance_guard.check(session, rollcalls[i], account=account)
+                print(f"[Attendance] {decision.message}")
+                if decision.complete:
                     answer_status[i] = True
-                    _notify_success(notifier, rollcalls[i], "Radar")
+                    continue
+                if not decision.allowed:
+                    continue
+                if rollcalls[i]['is_radar']:
+                    success = send_radar(session, rollcalls[i]['rollcall_id'])
+                    rollcall_type = "Radar"
                 else:
-                    print("Answering failed.")
-            elif rollcalls[i]['is_number']:
-                if send_code(session, rollcalls[i]['rollcall_id']):
+                    success = send_code(session, rollcalls[i]['rollcall_id'], decision.number_code)
+                    rollcall_type = "Number"
+                if success:
                     answer_status[i] = True
-                    _notify_success(notifier, rollcalls[i], "Number")
+                    _notify_success(notifier, rollcalls[i], rollcall_type)
                 else:
                     print("Answering failed.")
             else:
