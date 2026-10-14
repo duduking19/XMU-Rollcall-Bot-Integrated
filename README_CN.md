@@ -63,9 +63,10 @@ xmu start-all    # 同时监控所有已配置账号。
 
 ## 数字与雷达签到门槛
 
-发现待签到场次后，使用 `/api/timetable_rollcalls?course_ids=<course_id>&rollcall_date=<yyyy-mm-dd>`
-读取该场次的签到码和学生签到状态，不再从旧的 `student_rollcalls` 接口获取数字码。
-按课程 ID、北京时间日期和签到 ID 精确匹配，不使用其他场次的签到码。
+发现待签到场次后，数字签到使用 `/api/timetable_rollcalls?course_ids=<course_id>&rollcall_date=<yyyy-mm-dd>`
+读取签到码和学生签到状态，按课程 ID、UTC 日期和签到 ID 精确匹配，不使用其他场次的签到码。
+雷达签到使用 `/api/rollcall/<rollcall_id>` 读取该场次的学生签到状态，并校验签到 ID、课程 ID、
+雷达类型及时间信息；不依赖可能缺少雷达场次的课表结果。两种方式共用下面的人数门槛。
 
 数字和雷达签到均须同时满足以下条件：
 

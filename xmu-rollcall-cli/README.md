@@ -24,8 +24,10 @@ to have attended. Complete configured accounts are excluded from both counts,
 even if they are not selected for monitoring. Their student IDs must be verified
 using valid cached sessions. `on_call` and `on_call_fine` count as attended.
 
-Attendance and number codes come from `/api/timetable_rollcalls`, matched by course,
-campus date (UTC+8), and rollcall ID. Waiting rollcalls are reevaluated on each poll;
+Number attendance and codes come from `/api/timetable_rollcalls`, matched by course,
+UTC date, and rollcall ID. Radar attendance comes from `/api/rollcall/<rollcall_id>`,
+with rollcall ID, course ID, radar type, and timestamp checks, even when timetable
+results omit that radar rollcall. Waiting rollcalls are reevaluated on each poll;
 there is no extra fixed delay once the threshold passes. Finished or expired
 rollcalls are skipped. Missing or malformed data, unverified managed identities,
 and API errors block submission and are retried. Classes with fewer than 10 other

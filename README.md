@@ -69,9 +69,11 @@ including accounts omitted by `--account-id`. Student identities are verified wi
 `/api/profile`; an unresolved managed account blocks automatic submission until its
 cached session is valid. Only `on_call` and `on_call_fine` count as attended.
 
-After discovery, `/api/timetable_rollcalls?course_ids=<course_id>&rollcall_date=<yyyy-mm-dd>`
-supplies the attendance roster and number code. Records must match the course ID,
-campus date (UTC+8), and rollcall ID. The old number-code lookup is no longer used.
+For number rollcalls, `/api/timetable_rollcalls?course_ids=<course_id>&rollcall_date=<yyyy-mm-dd>`
+supplies the attendance roster and code, matched by course ID, UTC date, and rollcall ID.
+Radar rollcalls read their roster from `/api/rollcall/<rollcall_id>` and verify the
+rollcall ID, course ID, radar type, and timestamps, since timetable results may omit
+radar rollcalls. Both sources use the same attendance threshold below.
 Pending rollcalls are checked again each poll, even when discovery data is unchanged.
 Submission proceeds immediately once both thresholds are met, without an extra delay.
 Finished/expired rollcalls are skipped; API failures, missing data, duplicate student
