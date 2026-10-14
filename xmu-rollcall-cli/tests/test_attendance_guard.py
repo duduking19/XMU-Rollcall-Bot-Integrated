@@ -21,14 +21,14 @@ class AttendanceGuardTest(unittest.TestCase):
         return result
 
     def test_requires_both_ratio_and_count_including_exact_boundary(self):
-        for attended, total, allowed in [(10, 20, True), (9, 18, False), (10, 21, False),
-                                          (11, 21, True), (9, 9, False), (0, 0, False)]:
+        for attended, total, allowed in [(10, 33, True), (9, 18, False), (10, 34, False),
+                                          (12, 40, True), (11, 40, False), (9, 9, False), (0, 0, False)]:
             with self.subTest(attended=attended, total=total):
                 self.assertEqual(self.check(timetable(attended, total)).allowed, allowed)
 
     def test_excludes_every_managed_student_from_both_counts(self):
         for signed, total, other_status, expected in [
-            (10, 20, "absent", True), (9, 18, "on_call", False), (10, 21, "on_call", False),
+            (10, 33, "absent", True), (9, 18, "on_call", False), (10, 34, "on_call", False),
         ]:
             with self.subTest(signed=signed, total=total, other_status=other_status):
                 managed = [{"student_id": 900, "status": "absent"},
@@ -139,8 +139,8 @@ class AttendanceGuardTest(unittest.TestCase):
         self.assertFalse(self.check(rollcall=detected(course_id=None)).allowed)
 
     def test_radar_has_same_threshold_and_does_not_require_number_code(self):
-        for attended, total, expected in [(9, 18, False), (10, 20, True), (10, 21, False),
-                                          (11, 21, True), (9, 9, False), (0, 0, False)]:
+        for attended, total, expected in [(9, 18, False), (10, 33, True), (10, 34, False),
+                                          (12, 40, True), (11, 40, False), (9, 9, False), (0, 0, False)]:
             with self.subTest(attended=attended, total=total):
                 session = session_for([], radar_record=radar_detail(attended, total))
                 result = AttendanceGuard([1]).check(
@@ -156,8 +156,9 @@ class AttendanceGuardTest(unittest.TestCase):
                 session.put.assert_not_called()
 
     def test_radar_excludes_all_managed_students_from_both_counts(self):
-        for signed, total, status, expected in [(10, 20, "absent", True),
-                                               (9, 18, "on_call_fine", False)]:
+        for signed, total, status, expected in [(10, 33, "absent", True),
+                                               (9, 18, "on_call_fine", False),
+                                               (10, 34, "on_call_fine", False)]:
             with self.subTest(signed=signed):
                 managed = [{"student_id": 900, "status": "absent"},
                            {"student_id": 901, "status": status}]

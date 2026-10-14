@@ -19,7 +19,7 @@ A command-line tool for monitoring and auto-answering Tronclass rollcalls at Xia
 
 ## Attendance Threshold
 
-Number and radar rollcalls require **at least 50% and at least 10 other students**
+Number and radar rollcalls require **at least 30% and at least 10 other students**
 to have attended. Complete configured accounts are excluded from both counts,
 even if they are not selected for monitoring. Their student IDs must be verified
 using valid cached sessions. `on_call` and `on_call_fine` count as attended.

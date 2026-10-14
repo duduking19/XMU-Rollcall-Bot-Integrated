@@ -14,7 +14,7 @@ from .utils import load_session
 BASE_URL = "https://lnt.xmu.edu.cn"
 REQUEST_TIMEOUT = (5, 12)
 MIN_ATTENDEES = 10
-MIN_PERCENT = 50
+MIN_PERCENT = 30
 ATTENDED_STATUSES = {"on_call", "on_call_fine"}
 
 

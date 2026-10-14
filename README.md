@@ -63,7 +63,7 @@ Successful number, radar, and QR answers all emit a success notification.
 
 ## Attendance Threshold
 
-Number and radar submissions require **at least 50% and at least 10 other students**
+Number and radar submissions require **at least 30% and at least 10 other students**
 to have attended. All complete configured accounts are excluded from both counts,
 including accounts omitted by `--account-id`. Student identities are verified with
 `/api/profile`; an unresolved managed account blocks automatic submission until its
