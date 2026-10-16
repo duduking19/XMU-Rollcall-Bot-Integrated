@@ -14,6 +14,7 @@ import requests
 
 from .config import CONFIG_DIR
 from .attendance_guard import _id, _timestamp
+from .verify import DISTANCE_SECONDS
 
 try:
     import fcntl
@@ -141,7 +142,8 @@ def _session_settings(session):
     }
 
 
-def _campaign_worker(connection, settings, rollcall_id, account_id, student_id, course_id, end_time, deadline):
+def _campaign_worker(connection, settings, rollcall_id, account_id, student_id, course_id, end_time, deadline,
+                     stage="all", fallback_reason="distance_method_failed"):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         connection.close()
@@ -153,16 +155,21 @@ def _campaign_worker(connection, settings, rollcall_id, account_id, student_id, 
     threading.current_thread().name = f"xmu-account-{account_id}"
     try:
         from .network import configure_network
-        from .verify import send_radar
+        from .verify import send_radar, _RadarFallback
         configure_network()
         with requests.Session() as session:
             for key, value in settings.items():
                 setattr(session, key, value)
-            result = send_radar(
-                session, rollcall_id, student_id=student_id, course_id=course_id,
-                end_time=end_time, deadline=deadline,
-            )
-        connection.send(bool(result))
+            try:
+                result = send_radar(
+                    session, rollcall_id, student_id=student_id, course_id=course_id,
+                    end_time=end_time, deadline=deadline, stage=stage, fallback_reason=fallback_reason,
+                )
+            except _RadarFallback as fallback:
+                # Carry cookies and any newly learned end time into the next process.
+                result = {"status": "fallback", "settings": _session_settings(session),
+                          "end_time": fallback.end_time, "reason": fallback.reason}
+        connection.send(result)
     except Exception as exc:
         _log("worker_failed", account_id, rollcall_id, exception_type=type(exc).__name__)
         try:
@@ -185,12 +192,14 @@ def _stop_process(process):
         raise RuntimeError("campaign process did not stop")
 
 
-def _run_process(settings, rollcall_id, account_id, student_id, course_id, end_time, deadline):
+def _run_stage(settings, rollcall_id, account_id, student_id, course_id, end_time, deadline,
+               stage, fallback_reason="distance_method_failed"):
     context = multiprocessing.get_context("spawn")
     receiving, sending = context.Pipe(duplex=False)
     process = context.Process(
         target=_campaign_worker,
-        args=(sending, settings, rollcall_id, account_id, student_id, course_id, end_time, deadline),
+        args=(sending, settings, rollcall_id, account_id, student_id, course_id, end_time, deadline,
+              stage, fallback_reason),
         daemon=True,
     )
     started = False
@@ -210,6 +219,8 @@ def _run_process(settings, rollcall_id, account_id, student_id, course_id, end_t
             return "timeout" if process.exitcode == 124 or time.monotonic() >= deadline else "failed"
         if time.monotonic() >= deadline:
             return "timeout"
+        if stage == "distance" and isinstance(result, dict) and result.get("status") == "fallback":
+            return result
         return "success" if result is True else "failed"
     finally:
         try:
@@ -220,6 +231,28 @@ def _run_process(settings, rollcall_id, account_id, student_id, course_id, end_t
             sending.close()
             if not started or not process.is_alive():
                 process.close()
+
+
+def _run_process(settings, rollcall_id, account_id, student_id, course_id, end_time, deadline):
+    distance_deadline = min(deadline, time.monotonic() + DISTANCE_SECONDS)
+    _log("stage_start", account_id, rollcall_id, stage="distance")
+    result = _run_stage(settings, rollcall_id, account_id, student_id, course_id, end_time,
+                        distance_deadline, "distance")
+    if isinstance(result, dict):
+        settings, end_time = result["settings"], result["end_time"]
+        reason = result["reason"]
+        if end_time is not None:
+            deadline = min(deadline, time.monotonic() + _timestamp(end_time).timestamp() - time.time())
+    elif result == "timeout" and distance_deadline < deadline:
+        reason = "distance_timeout"
+    else:
+        return result
+    # _run_stage has already killed/reaped the old process. Never extend the total budget.
+    if time.monotonic() >= deadline:
+        return "timeout"
+    _log("stage_start", account_id, rollcall_id, stage="fallback", reason=reason)
+    return _run_stage(settings, rollcall_id, account_id, student_id, course_id, end_time,
+                      deadline, "fallback", reason)
 
 
 def run_radar_campaign(session, rollcall_id, *, account_id, student_id, course_id, end_time=None):

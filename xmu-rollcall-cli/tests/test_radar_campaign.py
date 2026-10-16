@@ -213,7 +213,7 @@ class RadarCampaignTest(unittest.TestCase):
     def test_timeout_terminates_then_kills_and_reaps_child(self):
         context, receiving, sending, process = self.fake_context()
         with patch.object(campaign.multiprocessing, "get_context", return_value=context) as factory:
-            self.assertEqual(campaign._run_process({}, 123, 1, 900, 42, None, time.monotonic() + 1), "timeout")
+            self.assertEqual(campaign._run_stage({}, 123, 1, 900, 42, None, time.monotonic() + 1, "distance"), "timeout")
         factory.assert_called_once_with("spawn")
         context.Pipe.assert_called_once_with(duplex=False)
         process.terminate.assert_called_once()
@@ -226,7 +226,7 @@ class RadarCampaignTest(unittest.TestCase):
     def test_eof_from_crashed_child_is_failure_not_a_busy_wait(self):
         context, receiving, _, process = self.fake_context(poll=True, eof=True)
         with patch.object(campaign.multiprocessing, "get_context", return_value=context):
-            self.assertEqual(campaign._run_process({}, 123, 1, 900, 42, None, time.monotonic() + 1), "failed")
+            self.assertEqual(campaign._run_stage({}, 123, 1, 900, 42, None, time.monotonic() + 1, "distance"), "failed")
         receiving.poll.assert_called_once()
         process.join.assert_any_call(timeout=1.0)
 
@@ -234,7 +234,126 @@ class RadarCampaignTest(unittest.TestCase):
         context, _, _, process = self.fake_context(poll=True, eof=True)
         process.exitcode = 124
         with patch.object(campaign.multiprocessing, "get_context", return_value=context):
-            self.assertEqual(campaign._run_process({}, 123, 1, 900, 42, None, time.monotonic() + 1), "timeout")
+            self.assertEqual(campaign._run_stage({}, 123, 1, 900, 42, None, time.monotonic() + 1, "distance"), "timeout")
+
+    def test_normal_distance_fallback_carries_settings_and_only_shortens_total_deadline(self):
+        initial = {"cookies": "original-synthetic-cookie"}
+        updated = {"cookies": SECRET, "headers": {"X-Stage": "updated"}}
+        for end_epoch, expected_deadline in [(2030.0, 1030.0), (2200.0, 1060.0)]:
+            with self.subTest(end_epoch=end_epoch):
+                end_time = datetime.fromtimestamp(end_epoch, timezone.utc).isoformat()
+                message = {"status": "fallback", "settings": updated, "end_time": end_time,
+                           "reason": "distance_method_failed"}
+                with patch.object(campaign.time, "monotonic", return_value=1000.0), \
+                        patch.object(campaign.time, "time", return_value=2000.0), \
+                        patch.object(campaign, "_run_stage", side_effect=[message, "success"]) as stage, \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    result = campaign._run_process(initial, 123, 1, 900, 42, None, 1060.0)
+                self.assertEqual(result, "success")
+                self.assertEqual(stage.call_count, 2)
+                self.assertEqual(stage.call_args_list[0].args,
+                                 (initial, 123, 1, 900, 42, None, 1010.0, "distance"))
+                self.assertEqual(stage.call_args_list[1].args,
+                                 (updated, 123, 1, 900, 42, end_time, expected_deadline,
+                                  "fallback", "distance_method_failed"))
+                self.assertNotIn(SECRET, output.getvalue())
+
+    def test_distance_timeout_runs_fallback_with_original_remaining_budget(self):
+        clock = [1000.0]
+        initial = {"cookies": SECRET}
+        def run_stage(*args):
+            if args[7] == "distance":
+                self.assertEqual(args[6], 1010.0)
+                clock[0] = 1010.0
+                return "timeout"
+            self.assertEqual(args, (initial, 123, 1, 900, 42, None, 1060.0,
+                                    "fallback", "distance_timeout"))
+            return "success"
+        with patch.object(campaign.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(campaign, "_run_stage", side_effect=run_stage) as stage, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(campaign._run_process(initial, 123, 1, 900, 42, None, 1060.0), "success")
+        self.assertEqual(stage.call_count, 2)
+        self.assertNotIn(SECRET, output.getvalue())
+
+    def test_total_deadline_before_ten_seconds_prevents_fallback(self):
+        clock = [1000.0]
+        def run_stage(*args):
+            self.assertEqual(args[6], 1005.0)
+            clock[0] = 1005.0
+            return "timeout"
+        with patch.object(campaign.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(campaign, "_run_stage", side_effect=run_stage) as stage, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(campaign._run_process({}, 123, 1, 900, 42, None, 1005.0), "timeout")
+        stage.assert_called_once()
+
+    def test_total_deadline_during_distance_cleanup_prevents_fallback(self):
+        clock = [1000.0]
+        def run_stage(*args):
+            clock[0] = 1060.1
+            return {"status": "fallback", "settings": {}, "end_time": None,
+                    "reason": "distance_method_failed"}
+        with patch.object(campaign.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(campaign, "_run_stage", side_effect=run_stage) as stage, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(campaign._run_process({}, 123, 1, 900, 42, None, 1060.0), "timeout")
+        stage.assert_called_once()
+
+    def test_distance_success_or_terminal_failure_never_starts_fallback(self):
+        for result in ("success", "failed"):
+            with self.subTest(result=result), \
+                    patch.object(campaign, "_run_stage", return_value=result) as stage, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(campaign._run_process({}, 123, 1, 900, 42, None,
+                                                       time.monotonic() + 60), result)
+            stage.assert_called_once()
+
+    def test_two_stages_share_one_claim_and_one_terminal_record(self):
+        message = {"status": "fallback", "settings": campaign._session_settings(self.session),
+                   "end_time": None, "reason": "distance_method_failed"}
+        with patch.object(campaign, "_claim", wraps=campaign._claim) as claim, \
+                patch.object(campaign, "_finish", wraps=campaign._finish) as finish, \
+                patch.object(campaign, "_run_stage", side_effect=[message, "success"]) as stage:
+            self.assertTrue(self.run_campaign())
+            claim.assert_called_once()
+            finish.assert_called_once_with("1", "123", "success")
+            self.assertEqual(stage.call_count, 2)
+            self.assertTrue(self.run_campaign())
+            self.assertEqual(stage.call_count, 2)
+            finish.assert_called_once()
+        entries = self.state()["attempts"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[campaign._key(1, 123)]["status"], "success")
+
+    def test_worker_returns_updated_cookies_and_end_time_for_normal_fallback(self):
+        from xmu_rollcall.verify import _RadarFallback
+        connection = MagicMock()
+        deadline = time.monotonic() + 2
+        end_time = "2030-01-01T00:00:00Z"
+        def distance_failed(session, rollcall_id, **kwargs):
+            self.assertEqual(kwargs["stage"], "distance")
+            session.cookies.set("session", "updated-" + SECRET, domain="lnt.xmu.edu.cn", path="/api")
+            session.headers["X-Stage"] = "updated"
+            raise _RadarFallback("distance_method_failed", end_time)
+        previous_name = threading.current_thread().name
+        try:
+            with patch("xmu_rollcall.verify.send_radar", side_effect=distance_failed), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                campaign._campaign_worker(connection, campaign._session_settings(self.session),
+                                          123, 1, 900, 42, None, deadline, "distance")
+        finally:
+            threading.current_thread().name = previous_name
+        connection.send.assert_called_once()
+        message = connection.send.call_args.args[0]
+        self.assertEqual(message["status"], "fallback")
+        self.assertEqual(message["reason"], "distance_method_failed")
+        self.assertEqual(message["end_time"], end_time)
+        self.assertEqual(message["settings"]["cookies"].get("session", domain="lnt.xmu.edu.cn", path="/api"),
+                         "updated-" + SECRET)
+        self.assertEqual(message["settings"]["headers"]["X-Stage"], "updated")
+        self.assertNotIn(SECRET, output.getvalue())
+        connection.close.assert_called_once()
 
     def test_real_slow_child_is_stopped_near_deadline_and_cannot_restart(self):
         before = {child.pid for child in multiprocessing.active_children()}
@@ -292,7 +411,8 @@ class RadarCampaignTest(unittest.TestCase):
         cookie = next(iter(copied.cookies))
         self.assertEqual((cookie.value, cookie.domain, cookie.path), (SECRET, "lnt.xmu.edu.cn", "/api"))
         self.assertEqual(copied.auth, self.session.auth)
-        self.assertEqual(radar.call_args.kwargs, dict(student_id=900, course_id=42, end_time=None, deadline=deadline))
+        self.assertEqual(radar.call_args.kwargs, dict(student_id=900, course_id=42, end_time=None, deadline=deadline,
+                                                       stage="all", fallback_reason="distance_method_failed"))
         connection.send.assert_called_once_with(True)
         connection.close.assert_called_once()
 

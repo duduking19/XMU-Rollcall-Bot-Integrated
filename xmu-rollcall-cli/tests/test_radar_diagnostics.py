@@ -175,9 +175,9 @@ class RadarDiagnosticsTest(unittest.TestCase):
             self.assertEqual(call.args, ("https://lnt.xmu.edu.cn/api/rollcall/123/answer",))
             timeout = call.kwargs["timeout"]
             self.assertIsInstance(timeout, Timeout)
-            self.assertEqual(timeout.total, 60.0)
+            self.assertEqual(timeout.total, 10.0 if index <= 4 else 60.0)
             self.assertEqual(timeout.connect_timeout, 5)
-            self.assertEqual(timeout.read_timeout, 12)
+            self.assertEqual(timeout.read_timeout, 10 if index <= 4 else 12)
             self.assertEqual(call.kwargs["headers"], headers)
             payload = dict(call.kwargs["json"])
             latitude, longitude = payload.pop("latitude"), payload.pop("longitude")

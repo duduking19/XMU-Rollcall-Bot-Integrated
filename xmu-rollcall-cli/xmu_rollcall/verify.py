@@ -27,6 +27,7 @@ RADAR_FALLBACK_LOCATIONS = (
     (24.6087, 118.3090),
     (24.6075, 118.2950),  # 24°36′27″ N, 118°17′42″ E.
 )
+DISTANCE_SECONDS = 10.0
 
 def send_code(in_session, rollcall_id, number_code):
     """Submit only the exact code selected by the attendance guard."""
@@ -54,6 +55,13 @@ class _RadarStopped(Exception):
         self.success = success
 
 
+class _RadarFallback(Exception):
+    """Pass normal distance failure and updated context to the stage supervisor."""
+    def __init__(self, reason, end_time):
+        self.reason = reason
+        self.end_time = end_time
+
+
 class _RadarRun:
     def __init__(self, session, rollcall_id, student_id, course_id, end_time, deadline, diagnostic):
         self.session = session
@@ -62,6 +70,7 @@ class _RadarRun:
         self.course_id = course_id
         self.end_time = end_time
         self.deadline = deadline
+        self.distance_deadline = None
         self.diagnostic = diagnostic
 
     def remaining(self):
@@ -74,6 +83,12 @@ class _RadarRun:
             if until_end <= 0:
                 raise _RadarStopped("rollcall_ended")
             remaining = min(remaining, until_end)
+        if self.distance_deadline is not None:
+            until_distance = self.distance_deadline - time.monotonic()
+            if until_distance <= 0:
+                self.diagnostic["phase"] = "budget"
+                raise _RadarStopped("distance_timeout")
+            remaining = min(remaining, until_distance)
         return remaining
 
     def timeout(self):
@@ -123,6 +138,7 @@ class _RadarRun:
                 raise _RadarStopped("student_not_absent")
         except (requests.RequestException, ValueError, TypeError, OverflowError) as exc:
             _radar_exception(self.diagnostic, exc)
+            self.remaining()
             raise _RadarStopped("status_check_failed") from None
 
 
@@ -143,12 +159,14 @@ def _radar_locations():
             yield f"fixed_{index}_{direction}", math.degrees(phi2), (math.degrees(lam2) + 180) % 360 - 180
 
 
-def send_radar(in_session, rollcall_id, *, student_id=None, course_id=None, end_time=None, deadline=None):
+def send_radar(in_session, rollcall_id, *, student_id=None, course_id=None, end_time=None, deadline=None,
+               stage="all", fallback_reason="distance_method_failed"):
     """Run one distance attempt and up to two search rounds within a shared deadline.
 
     Production callers use radar_campaign to persist the claim and enforce the
-    deadline in a terminable child process. Direct callers still check it before
-    and after every request, but requests alone cannot enforce wall-clock time.
+    distance and total deadlines in terminable child processes. Direct callers
+    check before/after requests, but requests alone cannot bound wall-clock time.
+    A distance-only stage raises _RadarFallback when the supervisor should advance.
     """
     diagnostic = {
         "rollcall_id": rollcall_id,
@@ -158,22 +176,36 @@ def send_radar(in_session, rollcall_id, *, student_id=None, course_id=None, end_
     run = _RadarRun(in_session, rollcall_id, student_id, course_id, end_time,
                     time.monotonic() + 60 if deadline is None else deadline, diagnostic)
     try:
+        if stage not in {"all", "distance", "fallback"}:
+            raise ValueError("invalid radar stage")
         # Missing identity must never allow an unchecked submission.
         _id(student_id)
         _id(course_id)
         _id(rollcall_id)
         run.remaining()
-        try:
-            if _send_radar(in_session, rollcall_id, diagnostic, run):
-                return True
-        except (requests.RequestException, ValueError, TypeError, OverflowError, ZeroDivisionError) as exc:
-            _radar_exception(diagnostic, exc)
+        if stage != "fallback":
+            run.distance_deadline = min(run.deadline, time.monotonic() + DISTANCE_SECONDS)
+            try:
+                if _send_radar(in_session, rollcall_id, diagnostic, run):
+                    return True
+            except _RadarStopped as stopped:
+                if stopped.reason != "distance_timeout" and not (
+                        stage == "distance" and stopped.reason == "budget_exhausted"):
+                    raise
+                fallback_reason = "distance_timeout"
+                _radar_log(diagnostic, "distance_timeout", reason=fallback_reason)
+            except (requests.RequestException, ValueError, TypeError, OverflowError, ZeroDivisionError) as exc:
+                _radar_exception(diagnostic, exc)
+            finally:
+                run.distance_deadline = None
+            if stage == "distance":
+                raise _RadarFallback(fallback_reason, run.end_time)
 
         run.remaining()
         diagnostic.update(attempt="fixed_1", phase="request", http_status=None)
         diagnostic.pop("json_type", None)
         diagnostic.pop("distance_type", None)
-        _radar_log(diagnostic, "fallback_start", reason="distance_method_failed")
+        _radar_log(diagnostic, "fallback_start", reason=fallback_reason)
         for round_number in (1, 2):
             if round_number == 2:
                 diagnostic["phase"] = "waiting"

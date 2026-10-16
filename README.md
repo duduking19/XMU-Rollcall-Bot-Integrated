@@ -85,7 +85,12 @@ Each account gets one radar campaign per rollcall, after the attendance threshol
 passes. Its **60-second total budget includes the original distance method**, status
 queries, fixed-location submissions, and the one-second pause between search rounds;
 waiting for the attendance threshold does not count. The original probes and circle
-intersections run once. If they fail, run at most two search rounds. Each round first
+intersections run once, with a **10-second hard limit from the start of the distance
+phase**, including its status GETs and answer PUTs. Failures such as missing distance
+or non-intersecting circles switch to fallback immediately. If the 10-second limit
+expires, terminate the distance worker first, then use the remaining 60-second total
+budget for at most two fixed-location search rounds. Neither transition resets the
+total budget or the persisted campaign claim. Each round first
 tries the three centers in order: **latitude 24.6082, longitude 118.2953**;
 **latitude 24.6087, longitude 118.3090**; **latitude 24.6075, longitude 118.2950**
 (24°36′27″ N, 118°17′42″ E). Then try each center's east, south, west, and north
@@ -95,14 +100,15 @@ The maximum is 30 fallback PUTs plus four original-method PUTs, subject to the b
 
 Before every PUT, query the rollcall detail and verify the activity and own attendance.
 Stop on HTTP 200, an already-attended status, a finished/expired activity, unverifiable
-status, HTTP 401/429, budget expiry, or exhausted rounds. Fixed responses need no
+status, HTTP 401/429, total-budget expiry, or exhausted rounds. Fixed responses need no
 distance or JSON body. The payload fields and attendance thresholds are unchanged;
-request timeouts shrink to the remaining time. The whole campaign runs in a spawned
-child process that is terminated at its deadline, including when DNS or a slow response
-blocks requests. A request already received by the server cannot be recalled.
+request timeouts shrink to the remaining phase and total budgets. Distance and fallback
+work run in spawned child processes that are terminated at their deadlines, including
+when DNS or a slow response blocks requests. A request already received by the server
+cannot be recalled.
 
 Claims are atomically persisted in `~/.xmu_rollcall/radar_attempts.json` before starting
-the child. Later polls and service restarts never restart a claimed campaign, including
+the first child. Later polls and service restarts never restart a claimed campaign, including
 one interrupted mid-flight. Failure to save the claim prevents submission. The persistent
 lock requires POSIX `fcntl` (Linux/macOS); unsupported platforms stop without submitting.
 

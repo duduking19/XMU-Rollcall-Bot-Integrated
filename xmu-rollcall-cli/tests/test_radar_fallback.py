@@ -15,7 +15,7 @@ from urllib3.util import Timeout
 
 from xmu_rollcall.attendance_guard import AttendanceGuard
 from xmu_rollcall.rollcall_handler import handle_rollcalls
-from xmu_rollcall.verify import headers, send_radar
+from xmu_rollcall.verify import headers, send_radar, _RadarFallback
 
 
 FIXED_LOCATIONS = [(24.6082, 118.2953), (24.6087, 118.3090), (24.6075, 118.2950)]
@@ -381,8 +381,67 @@ class RadarFallbackTest(unittest.TestCase):
         session.get.side_effect, session.put.side_effect = get, put
         result, _ = self.run_radar(session, clock=clock)
         self.assertTrue(result)
-        self.assertEqual([call.kwargs["timeout"].total for call in session.get.call_args_list], [60, 55])
-        self.assertEqual([call.kwargs["timeout"].total for call in session.put.call_args_list], [58, 53])
+        self.assertEqual([call.kwargs["timeout"].total for call in session.get.call_args_list], [10, 55])
+        self.assertEqual([call.kwargs["timeout"].total for call in session.put.call_args_list], [8, 53])
+
+    def test_distance_deadline_during_status_get_switches_to_fixed_with_remaining_budget(self):
+        session, clock = MagicMock(), [1000.0]
+
+        def get(*args, **kwargs):
+            if session.get.call_count == 1:
+                clock[0] = 1010.0
+            return response(radar_detail())
+
+        session.get.side_effect = get
+        session.put.return_value = fixed_response(200)
+        result, events = self.run_radar(session, clock=clock)
+        self.assertTrue(result)
+        self.assertEqual([call.kwargs["timeout"].total for call in session.get.call_args_list], [10, 50])
+        self.assert_fixed_calls(session, 0, count=1)
+        self.assertEqual(session.put.call_args.kwargs["timeout"].total, 50)
+        self.assert_event(events, event="fallback_start", reason="distance_timeout")
+
+    def test_distance_only_reports_failure_or_deadline_without_submitting_fixed_points(self):
+        for elapsed, reason in [(0.25, "distance_method_failed"), (10.0, "distance_timeout")]:
+            with self.subTest(elapsed=elapsed):
+                session, clock = MagicMock(), [1000.0]
+                end_time = "2099-01-01T00:00:00Z"
+
+                def put(*args, **kwargs):
+                    clock[0] += elapsed
+                    return response({}, 400)
+
+                session.put.side_effect = put
+                with self.assertRaises(_RadarFallback) as caught:
+                    self.run_radar(session, clock=clock, state=radar_detail(end_time=end_time),
+                                   stage="distance", deadline=1010.0)
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertEqual(caught.exception.end_time, end_time)
+                session.put.assert_called_once()
+                self.assertEqual(session.put.call_args.kwargs["json"]["latitude"], 24.3)
+
+    def test_fallback_only_starts_at_first_center_without_repeating_distance(self):
+        session = MagicMock()
+        session.put.return_value = fixed_response(200)
+        result, events = self.run_radar(session, stage="fallback", deadline=1050,
+                                        fallback_reason="distance_timeout")
+        self.assertTrue(result)
+        self.assert_fixed_calls(session, 0, count=1)
+        self.assertEqual(session.get.call_args.kwargs["timeout"].total, 50)
+        self.assert_event(events, event="fallback_start", reason="distance_timeout")
+
+    def test_total_deadline_before_distance_limit_never_falls_back(self):
+        session, clock = MagicMock(), [1000.0]
+
+        def put(*args, **kwargs):
+            clock[0] = 1003.0
+            return response({}, 400)
+
+        session.put.side_effect = put
+        result, events = self.run_radar(session, clock=clock, deadline=1003.0)
+        self.assertFalse(result)
+        session.put.assert_called_once()
+        self.assertFalse(any(event["event"] == "fallback_start" for event in events))
 
     def test_deadline_before_start_or_during_status_get_prevents_put(self):
         session = MagicMock()

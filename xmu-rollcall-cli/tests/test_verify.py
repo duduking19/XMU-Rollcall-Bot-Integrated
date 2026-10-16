@@ -19,9 +19,9 @@ class AnswerSubmissionTest(unittest.TestCase):
     def assert_radar_timeout(self, call):
         timeout = call.kwargs["timeout"]
         self.assertIsInstance(timeout, Timeout)
-        self.assertEqual(timeout.total, 60.0)
+        self.assertEqual(timeout.total, 10.0)
         self.assertEqual(timeout.connect_timeout, 5)
-        self.assertEqual(timeout.read_timeout, 12)
+        self.assertEqual(timeout.read_timeout, 10)
 
     def test_number_uses_supplied_code_without_old_api_or_sleep(self):
         session = MagicMock()
