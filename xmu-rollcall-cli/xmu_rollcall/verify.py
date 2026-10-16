@@ -18,6 +18,9 @@ headers = {
     "Referer": "https://ids.xmu.edu.cn/authserver/login",
 }
 
+# (latitude, longitude), in fallback order; retain the supplied four decimal places.
+RADAR_FALLBACK_LOCATIONS = ((24.6082, 118.2953), (24.6087, 118.3090))
+
 def send_code(in_session, rollcall_id, number_code):
     """Submit only the exact code selected by the attendance guard."""
     if not valid_number_code(number_code):
@@ -45,56 +48,84 @@ def send_radar(in_session, rollcall_id):
         "attempt": "probe_1", "phase": "request", "http_status": None,
     }
     try:
-        return _send_radar(in_session, rollcall_id, diagnostic)
+        if _send_radar(in_session, rollcall_id, diagnostic):
+            return True
     except (requests.RequestException, ValueError, TypeError, OverflowError, ZeroDivisionError) as exc:
-        reason = {
-            "request": "request_failed", "json": "json_decode_failed",
-            "distance": "distance_validation_failed", "geometry": "geometry_failed",
-        }.get(diagnostic["phase"], "radar_failed")
-        # Only these locally generated messages are safe to include verbatim.
-        # Request/JSON exceptions can contain URLs, tokens or response bodies.
-        if type(exc) is ValueError and exc.args in (
-            ("missing radar distance",), ("invalid radar distance",),
-        ):
-            reason = exc.args[0]
-        details = {"exception_type": type(exc).__name__, "reason": reason}
-        if isinstance(exc, (json.JSONDecodeError, requests.exceptions.JSONDecodeError)):
-            details.update(json_line=exc.lineno, json_column=exc.colno)
-        _radar_log(diagnostic, "exception", **details)
-        print("Failed to submit radar answer: invalid response or request failure.")
-        return False
+        _radar_exception(diagnostic, exc)
+
+    diagnostic.update(attempt="fixed_1", phase="request", http_status=None)
+    diagnostic.pop("json_type", None)
+    diagnostic.pop("distance_type", None)
+    _radar_log(diagnostic, "fallback_start", reason="distance_method_failed")
+    for index, (latitude, longitude) in enumerate(RADAR_FALLBACK_LOCATIONS, 1):
+        try:
+            response = _radar_submit(
+                in_session, rollcall_id, diagnostic,
+                _radar_payload(latitude, longitude), f"fixed_{index}",
+            )
+            # Fixed locations do not depend on a distance or JSON response body.
+            if response.status_code == 200:
+                _radar_log(diagnostic, "success")
+                return True
+        except (requests.RequestException, ValueError, TypeError, OverflowError, ZeroDivisionError) as exc:
+            _radar_exception(diagnostic, exc)
+    _radar_log(diagnostic, "failed", reason="all_fixed_locations_rejected")
+    return False
 
 
 def _radar_log(diagnostic, event, **details):
     print("[Radar] " + json.dumps({**diagnostic, "event": event, **details}, ensure_ascii=True))
 
 
-def _send_radar(in_session, rollcall_id, diagnostic):
-    url = f"{base_url}/api/rollcall/{rollcall_id}/answer"
+def _radar_exception(diagnostic, exc):
+    reason = {
+        "request": "request_failed", "json": "json_decode_failed",
+        "distance": "distance_validation_failed", "geometry": "geometry_failed",
+    }.get(diagnostic["phase"], "radar_failed")
+    # Request/JSON exceptions can contain URLs, tokens or response bodies.
+    if type(exc) is ValueError and exc.args in (
+        ("missing radar distance",), ("invalid radar distance",),
+    ):
+        reason = exc.args[0]
+    details = {"exception_type": type(exc).__name__, "reason": reason}
+    if isinstance(exc, (json.JSONDecodeError, requests.exceptions.JSONDecodeError)):
+        details.update(json_line=exc.lineno, json_column=exc.colno)
+    _radar_log(diagnostic, "exception", **details)
+    print("Failed to submit radar answer: invalid response or request failure.")
 
+
+def _radar_payload(lat, lon):
+    return {
+        "accuracy": 35,
+        "altitude": 0,
+        "altitudeAccuracy": None,
+        "deviceId": str(uuid.uuid4()),
+        "heading": None,
+        "latitude": lat,
+        "longitude": lon,
+        "speed": None,
+    }
+
+
+def _radar_submit(in_session, rollcall_id, diagnostic, data, attempt):
+    diagnostic.update(attempt=attempt, phase="request", http_status=None)
+    diagnostic.pop("json_type", None)
+    diagnostic.pop("distance_type", None)
+    response = in_session.put(
+        f"{base_url}/api/rollcall/{rollcall_id}/answer",
+        json=data, headers=headers, timeout=REQUEST_TIMEOUT,
+    )
+    diagnostic.update(phase="response", http_status=response.status_code)
+    _radar_log(diagnostic, "http_response")
+    return response
+
+
+def _send_radar(in_session, rollcall_id, diagnostic):
     lat_1, lat_2 = 24.3, 24.6
     lon_1, lon_2 = 118.0, 118.2
 
-    def payload(lat, lon):
-        return {
-            "accuracy": 35,
-            "altitude": 0,
-            "altitudeAccuracy": None,
-            "deviceId": str(uuid.uuid4()),
-            "heading": None,
-            "latitude": lat,
-            "longitude": lon,
-            "speed": None
-        }
-
     def submit(data, attempt):
-        diagnostic.update(attempt=attempt, phase="request", http_status=None)
-        diagnostic.pop("json_type", None)
-        diagnostic.pop("distance_type", None)
-        response = in_session.put(url, json=data, headers=headers, timeout=REQUEST_TIMEOUT)
-        diagnostic.update(phase="response", http_status=response.status_code)
-        _radar_log(diagnostic, "http_response")
-        return response
+        return _radar_submit(in_session, rollcall_id, diagnostic, data, attempt)
 
     def read_distance(response):
         diagnostic["phase"] = "json"
@@ -106,12 +137,12 @@ def _send_radar(in_session, rollcall_id, diagnostic):
         )
         return _distance(data)
 
-    res_1 = submit(payload(lat_1, lon_1), "probe_1")
+    res_1 = submit(_radar_payload(lat_1, lon_1), "probe_1")
     if res_1.status_code == 200:
         return True
     distance_1 = read_distance(res_1)
 
-    res_2 = submit(payload(lat_2, lon_2), "probe_2")
+    res_2 = submit(_radar_payload(lat_2, lon_2), "probe_2")
     if res_2.status_code == 200:
         return True
     distance_2 = read_distance(res_2)
@@ -171,8 +202,8 @@ def _send_radar(in_session, rollcall_id, diagnostic):
         _radar_log(diagnostic, "failed", reason="no_circle_intersection")
         return False
 
-    payload_1 = payload(sol_x_1, sol_y_1)
-    payload_2 = payload(sol_x_2, sol_y_2)
+    payload_1 = _radar_payload(sol_x_1, sol_y_1)
+    payload_2 = _radar_payload(sol_x_2, sol_y_2)
 
     res_3 = submit(payload_1, "candidate_1")
     if res_3.status_code == 200:

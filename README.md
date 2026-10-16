@@ -81,16 +81,27 @@ IDs, and unavailable codes block submission. Counts and allow decisions are neve
 Classes with fewer than 10 other students cannot pass the threshold. QR scanning
 and success notifications retain their existing behavior; waiting reasons are logged.
 
+Radar submissions first try the existing distance probes and circle intersections.
+If that method fails (including request/JSON errors, missing or invalid distance,
+no intersections, or both candidates being rejected), they try two fixed locations
+in order: **latitude 24.6082, longitude 118.2953**, then **latitude 24.6087,
+longitude 118.3090**. The supplied four decimal places are retained. Fixed-location
+responses do not need a distance field. Any HTTP 200 ends the attempt immediately;
+each round adds at most two fixed-location requests, for at most six requests total.
+A failed fixed-location request does not prevent trying the next location. The
+attendance threshold, request payload fields/timeouts, and polling retries stay the same.
+
 Radar submission emits `[Radar]` JSON diagnostics with the rollcall ID, account
-worker (for example `xmu-account-1`), probe/candidate attempt, processing phase, and
+worker (for example `xmu-account-1`), probe/candidate/fixed attempt, processing phase, and
 HTTP status (`null` when no response arrived). Exceptions include their concrete
 type and a fixed reason; JSON errors include line/column, and distance errors
 include field types. Request errors, malformed JSON, missing/invalid distance,
 non-intersecting circles, and rejected candidates can be distinguished without
 logging raw exception text, response bodies, cookies, device IDs, or coordinates.
 Non-200 probe responses may carry valid distances; check subsequent `exception`
-or `failed` events before treating them as failures. Request sequence, payloads,
-timeouts, success decisions, and attendance thresholds are unchanged.
+or `failed` events before treating them as failures. A `fallback_start` event marks
+the switch to fixed locations; `fixed_1` and `fixed_2` identify those requests, with
+`success` on a fixed-location HTTP 200 or `all_fixed_locations_rejected` if both fail.
 
 ## Multi-Account Monitoring
 
