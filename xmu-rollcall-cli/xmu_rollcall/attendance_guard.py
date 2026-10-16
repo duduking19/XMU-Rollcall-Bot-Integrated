@@ -28,6 +28,8 @@ class AttendanceDecision:
     complete: bool = False
     message: str = ""
     number_code: str = ""
+    student_id: str = ""
+    end_time: str = None
 
 
 def _id(value):
@@ -205,4 +207,5 @@ class AttendanceGuard:
         number_code = record.get("number_code") if is_number else ""
         if is_number and not valid_number_code(number_code):
             return AttendanceDecision(message=f"Waiting: number code is unavailable. {summary}")
-        return AttendanceDecision(allowed=True, message=f"Threshold met. {summary}", number_code=number_code)
+        return AttendanceDecision(allowed=True, message=f"Threshold met. {summary}", number_code=number_code,
+                                  student_id=own_student_id, end_time=record.get("end_time"))

@@ -2,9 +2,12 @@ import uuid
 import math
 import json
 import threading
+import time
 import requests
+from datetime import datetime, timezone
+from urllib3.util import Timeout
 
-from .attendance_guard import REQUEST_TIMEOUT, valid_number_code
+from .attendance_guard import REQUEST_TIMEOUT, valid_number_code, _id, _timestamp
 
 base_url = "https://lnt.xmu.edu.cn"
 headers = {
@@ -45,46 +48,168 @@ def send_code(in_session, rollcall_id, number_code):
     return False
 
 
-def send_radar(in_session, rollcall_id):
+class _RadarStopped(Exception):
+    def __init__(self, reason, success=False):
+        self.reason = reason
+        self.success = success
+
+
+class _RadarRun:
+    def __init__(self, session, rollcall_id, student_id, course_id, end_time, deadline, diagnostic):
+        self.session = session
+        self.rollcall_id = rollcall_id
+        self.student_id = student_id
+        self.course_id = course_id
+        self.end_time = end_time
+        self.deadline = deadline
+        self.diagnostic = diagnostic
+
+    def remaining(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            self.diagnostic["phase"] = "budget"
+            raise _RadarStopped("budget_exhausted")
+        if self.end_time is not None:
+            until_end = (_timestamp(self.end_time) - datetime.now(timezone.utc)).total_seconds()
+            if until_end <= 0:
+                raise _RadarStopped("rollcall_ended")
+            remaining = min(remaining, until_end)
+        return remaining
+
+    def timeout(self):
+        remaining = self.remaining()
+        # The parent process enforces the wall-clock deadline, including slow reads/DNS.
+        return Timeout(total=remaining, connect=min(REQUEST_TIMEOUT[0], remaining),
+                       read=min(REQUEST_TIMEOUT[1], remaining))
+
+    def check_status(self):
+        self.remaining()
+        self.diagnostic.update(phase="status_request", http_status=None)
+        try:
+            response = self.session.get(
+                f"{base_url}/api/rollcall/{self.rollcall_id}",
+                headers=headers, timeout=self.timeout(), allow_redirects=False,
+            )
+            self.diagnostic.update(phase="status_response", http_status=response.status_code)
+            _radar_log(self.diagnostic, "status_response")
+            self.remaining()
+            if response.status_code != 200:
+                raise _RadarStopped("status_check_failed")
+            self.diagnostic["phase"] = "status_json"
+            record = response.json()
+            self.diagnostic["phase"] = "status_validation"
+            if (not isinstance(record, dict) or _id(record.get("id")) != _id(self.rollcall_id)
+                    or _id(record.get("course_id")) != _id(self.course_id)
+                    or record.get("is_radar") is not True):
+                raise _RadarStopped("status_validation_failed")
+            if record.get("status") == "finished":
+                raise _RadarStopped("rollcall_ended")
+            if record.get("status") != "in_progress":
+                raise _RadarStopped("status_validation_failed")
+            # Preserve any known end time if a later response omits it.
+            if record.get("end_time") is not None:
+                self.end_time = record["end_time"]
+            self.remaining()
+            rows = record.get("student_rollcalls")
+            if not isinstance(rows, list):
+                raise _RadarStopped("status_validation_failed")
+            own = [row for row in rows if isinstance(row, dict)
+                   and _id(row.get("student_id")) == _id(self.student_id)]
+            if len(own) != 1:
+                raise _RadarStopped("status_validation_failed")
+            if own[0].get("status") in {"on_call", "on_call_fine"}:
+                raise _RadarStopped("already_answered", success=True)
+            if own[0].get("status") != "absent":
+                raise _RadarStopped("student_not_absent")
+        except (requests.RequestException, ValueError, TypeError, OverflowError) as exc:
+            _radar_exception(self.diagnostic, exc)
+            raise _RadarStopped("status_check_failed") from None
+
+
+def _radar_locations():
+    """Three centers first, then each center's E/S/W/N points at 100 metres."""
+    for index, (lat, lon) in enumerate(RADAR_FALLBACK_LOCATIONS, 1):
+        yield f"fixed_{index}", lat, lon
+    angular_distance = 100.0 / 6371000.0
+    for index, (lat, lon) in enumerate(RADAR_FALLBACK_LOCATIONS, 1):
+        phi, lam = math.radians(lat), math.radians(lon)
+        for direction, bearing in (("east", 90), ("south", 180), ("west", 270), ("north", 0)):
+            theta = math.radians(bearing)
+            phi2 = math.asin(math.sin(phi) * math.cos(angular_distance)
+                             + math.cos(phi) * math.sin(angular_distance) * math.cos(theta))
+            lam2 = lam + math.atan2(math.sin(theta) * math.sin(angular_distance) * math.cos(phi),
+                                    math.cos(angular_distance) - math.sin(phi) * math.sin(phi2))
+            # Keep full computed precision; rounding to four decimals shifts a 100m point.
+            yield f"fixed_{index}_{direction}", math.degrees(phi2), (math.degrees(lam2) + 180) % 360 - 180
+
+
+def send_radar(in_session, rollcall_id, *, student_id=None, course_id=None, end_time=None, deadline=None):
+    """Run one distance attempt and up to two search rounds within a shared deadline.
+
+    Production callers use radar_campaign to persist the claim and enforce the
+    deadline in a terminable child process. Direct callers still check it before
+    and after every request, but requests alone cannot enforce wall-clock time.
+    """
     diagnostic = {
         "rollcall_id": rollcall_id,
         "worker": threading.current_thread().name,
         "attempt": "probe_1", "phase": "request", "http_status": None,
     }
+    run = _RadarRun(in_session, rollcall_id, student_id, course_id, end_time,
+                    time.monotonic() + 60 if deadline is None else deadline, diagnostic)
     try:
-        if _send_radar(in_session, rollcall_id, diagnostic):
-            return True
-    except (requests.RequestException, ValueError, TypeError, OverflowError, ZeroDivisionError) as exc:
-        _radar_exception(diagnostic, exc)
-
-    diagnostic.update(attempt="fixed_1", phase="request", http_status=None)
-    diagnostic.pop("json_type", None)
-    diagnostic.pop("distance_type", None)
-    _radar_log(diagnostic, "fallback_start", reason="distance_method_failed")
-    for index, (latitude, longitude) in enumerate(RADAR_FALLBACK_LOCATIONS, 1):
+        # Missing identity must never allow an unchecked submission.
+        _id(student_id)
+        _id(course_id)
+        _id(rollcall_id)
+        run.remaining()
         try:
-            response = _radar_submit(
-                in_session, rollcall_id, diagnostic,
-                _radar_payload(latitude, longitude), f"fixed_{index}",
-            )
-            # Fixed locations do not depend on a distance or JSON response body.
-            if response.status_code == 200:
-                _radar_log(diagnostic, "success")
+            if _send_radar(in_session, rollcall_id, diagnostic, run):
                 return True
         except (requests.RequestException, ValueError, TypeError, OverflowError, ZeroDivisionError) as exc:
             _radar_exception(diagnostic, exc)
-    _radar_log(diagnostic, "failed", reason="all_fixed_locations_rejected")
+
+        run.remaining()
+        diagnostic.update(attempt="fixed_1", phase="request", http_status=None)
+        diagnostic.pop("json_type", None)
+        diagnostic.pop("distance_type", None)
+        _radar_log(diagnostic, "fallback_start", reason="distance_method_failed")
+        for round_number in (1, 2):
+            if round_number == 2:
+                diagnostic["phase"] = "waiting"
+                time.sleep(min(1.0, run.remaining()))
+            run.remaining()
+            diagnostic.update(round=round_number, attempt="fixed_1", phase="request", http_status=None)
+            _radar_log(diagnostic, "round_start")
+            for attempt, latitude, longitude in _radar_locations():
+                try:
+                    response = _radar_submit(in_session, rollcall_id, diagnostic,
+                                             _radar_payload(latitude, longitude), attempt, run)
+                    if response.status_code == 200:
+                        _radar_log(diagnostic, "success")
+                        return True
+                except (requests.RequestException, ValueError, TypeError, OverflowError, ZeroDivisionError) as exc:
+                    _radar_exception(diagnostic, exc)
+            _radar_log(diagnostic, "round_end")
+        _radar_log(diagnostic, "failed", reason="all_fixed_locations_rejected")
+    except _RadarStopped as stopped:
+        _radar_log(diagnostic, "stopped", reason=stopped.reason)
+        return stopped.success
+    except (ValueError, TypeError, OverflowError) as exc:
+        _radar_exception(diagnostic, exc)
     return False
 
 
 def _radar_log(diagnostic, event, **details):
-    print("[Radar] " + json.dumps({**diagnostic, "event": event, **details}, ensure_ascii=True))
+    print("[Radar] " + json.dumps({**diagnostic, "event": event, **details}, ensure_ascii=True), flush=True)
 
 
 def _radar_exception(diagnostic, exc):
     reason = {
         "request": "request_failed", "json": "json_decode_failed",
         "distance": "distance_validation_failed", "geometry": "geometry_failed",
+        "status_request": "status_request_failed", "status_json": "status_json_failed",
+        "status_validation": "status_validation_failed",
     }.get(diagnostic["phase"], "radar_failed")
     # Request/JSON exceptions can contain URLs, tokens or response bodies.
     if type(exc) is ValueError and exc.args in (
@@ -111,25 +236,30 @@ def _radar_payload(lat, lon):
     }
 
 
-def _radar_submit(in_session, rollcall_id, diagnostic, data, attempt):
+def _radar_submit(in_session, rollcall_id, diagnostic, data, attempt, run):
     diagnostic.update(attempt=attempt, phase="request", http_status=None)
     diagnostic.pop("json_type", None)
     diagnostic.pop("distance_type", None)
+    run.check_status()
+    diagnostic.update(phase="request", http_status=None)
     response = in_session.put(
         f"{base_url}/api/rollcall/{rollcall_id}/answer",
-        json=data, headers=headers, timeout=REQUEST_TIMEOUT,
+        json=data, headers=headers, timeout=run.timeout(), allow_redirects=False,
     )
     diagnostic.update(phase="response", http_status=response.status_code)
     _radar_log(diagnostic, "http_response")
+    run.remaining()
+    if response.status_code in (401, 429):
+        raise _RadarStopped("authentication_failed" if response.status_code == 401 else "rate_limited")
     return response
 
 
-def _send_radar(in_session, rollcall_id, diagnostic):
+def _send_radar(in_session, rollcall_id, diagnostic, run):
     lat_1, lat_2 = 24.3, 24.6
     lon_1, lon_2 = 118.0, 118.2
 
     def submit(data, attempt):
-        return _radar_submit(in_session, rollcall_id, diagnostic, data, attempt)
+        return _radar_submit(in_session, rollcall_id, diagnostic, data, attempt, run)
 
     def read_distance(response):
         diagnostic["phase"] = "json"

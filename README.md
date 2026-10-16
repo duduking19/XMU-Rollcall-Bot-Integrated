@@ -81,19 +81,33 @@ IDs, and unavailable codes block submission. Counts and allow decisions are neve
 Classes with fewer than 10 other students cannot pass the threshold. QR scanning
 and success notifications retain their existing behavior; waiting reasons are logged.
 
-Radar submissions first try the existing distance probes and circle intersections.
-If that method fails (including request/JSON errors, missing or invalid distance,
-no intersections, or both candidates being rejected), they try three fixed locations
-in order: **latitude 24.6082, longitude 118.2953**, then **latitude 24.6087,
-longitude 118.3090**, then **latitude 24.6075, longitude 118.2950** (converted from
-24°36′27″ N, 118°17′42″ E). Four decimal places are retained. Fixed-location
-responses do not need a distance field. Any HTTP 200 ends the attempt immediately;
-each round adds at most three fixed-location requests, for at most seven requests total.
-A failed fixed-location request does not prevent trying the next location. The
-attendance threshold, request payload fields/timeouts, and polling retries stay the same.
+Each account gets one radar campaign per rollcall, after the attendance threshold
+passes. Its **60-second total budget includes the original distance method**, status
+queries, fixed-location submissions, and the one-second pause between search rounds;
+waiting for the attendance threshold does not count. The original probes and circle
+intersections run once. If they fail, run at most two search rounds. Each round first
+tries the three centers in order: **latitude 24.6082, longitude 118.2953**;
+**latitude 24.6087, longitude 118.3090**; **latitude 24.6075, longitude 118.2950**
+(24°36′27″ N, 118°17′42″ E). Then try each center's east, south, west, and north
+points 100 metres away, in center order. Each of the 15 points is tried once per
+round. Preserve the centers' four decimals and full computed precision for offsets.
+The maximum is 30 fallback PUTs plus four original-method PUTs, subject to the budget.
+
+Before every PUT, query the rollcall detail and verify the activity and own attendance.
+Stop on HTTP 200, an already-attended status, a finished/expired activity, unverifiable
+status, HTTP 401/429, budget expiry, or exhausted rounds. Fixed responses need no
+distance or JSON body. The payload fields and attendance thresholds are unchanged;
+request timeouts shrink to the remaining time. The whole campaign runs in a spawned
+child process that is terminated at its deadline, including when DNS or a slow response
+blocks requests. A request already received by the server cannot be recalled.
+
+Claims are atomically persisted in `~/.xmu_rollcall/radar_attempts.json` before starting
+the child. Later polls and service restarts never restart a claimed campaign, including
+one interrupted mid-flight. Failure to save the claim prevents submission. The persistent
+lock requires POSIX `fcntl` (Linux/macOS); unsupported platforms stop without submitting.
 
 Radar submission emits `[Radar]` JSON diagnostics with the rollcall ID, account
-worker (for example `xmu-account-1`), probe/candidate/fixed attempt, processing phase, and
+worker (for example `xmu-account-1`), probe/candidate/fixed attempt, round, processing phase, and
 HTTP status (`null` when no response arrived). Exceptions include their concrete
 type and a fixed reason; JSON errors include line/column, and distance errors
 include field types. Request errors, malformed JSON, missing/invalid distance,
@@ -101,8 +115,10 @@ non-intersecting circles, and rejected candidates can be distinguished without
 logging raw exception text, response bodies, cookies, device IDs, or coordinates.
 Non-200 probe responses may carry valid distances; check subsequent `exception`
 or `failed` events before treating them as failures. A `fallback_start` event marks
-the switch to fixed locations; `fixed_1`, `fixed_2`, and `fixed_3` identify those requests,
-with `success` on a fixed-location HTTP 200 or `all_fixed_locations_rejected` if all fail.
+the switch to fixed locations; `fixed_1/2/3` identify centers, and direction suffixes
+such as `fixed_1_east` identify offsets. `status_response`, `round_start/round_end`,
+`success`, and `stopped` identify status checks, rounds, and termination. Campaign
+logs separately identify the persisted claim and process timeout without logging secrets.
 
 ## Multi-Account Monitoring
 
