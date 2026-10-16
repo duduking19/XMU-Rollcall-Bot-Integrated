@@ -1,0 +1,180 @@
+"""Offline Radar diagnostics tests; all school requests are mocked."""
+
+import contextlib
+import io
+import json
+import threading
+import unittest
+from unittest.mock import MagicMock, patch
+
+import requests
+
+from attendance_fixtures import response
+from xmu_rollcall.attendance_guard import REQUEST_TIMEOUT
+from xmu_rollcall.verify import headers, send_radar
+
+
+SECRET = "private-cookie-and-response-secret"
+ATTEMPTS = ["probe_1", "probe_2", "candidate_1", "candidate_2"]
+
+
+class RadarDiagnosticsTest(unittest.TestCase):
+    def run_radar(self, session, worker="xmu-account-2"):
+        output = io.StringIO()
+        thread = threading.current_thread()
+        previous_name = thread.name
+        try:
+            thread.name = worker
+            with contextlib.redirect_stdout(output):
+                result = send_radar(session, 123)
+        finally:
+            thread.name = previous_name
+        raw = output.getvalue()
+        self.assertNotIn(SECRET, raw)
+        events = [json.loads(line[len("[Radar] "):]) for line in raw.splitlines()
+                  if line.startswith("[Radar] ")]
+        self.assertTrue(events, "Radar attempts must emit structured diagnostics")
+        allowed = {"rollcall_id", "worker", "attempt", "phase", "http_status", "event",
+                   "exception_type", "reason", "json_line", "json_column", "json_type", "distance_type"}
+        for event in events:
+            self.assertEqual(event["rollcall_id"], 123)
+            self.assertEqual(event["worker"], worker)
+            self.assertIn(event["attempt"], ATTEMPTS + ["solve"])
+            self.assertIn(event["phase"], {"request", "json", "distance", "response", "geometry"})
+            self.assertIn(event["event"], {"http_response", "exception", "failed"})
+            self.assertIn("http_status", event)
+            self.assertTrue(event["http_status"] is None or type(event["http_status"]) is int)
+            self.assertFalse(set(event) - allowed, "Diagnostics must not contain bodies, payloads or coordinates")
+        session.get.assert_not_called()
+        return result, events
+
+    def assert_event(self, events, **expected):
+        self.assertTrue(any(all(row.get(key) == value for key, value in expected.items())
+                            for row in events), f"Missing event {expected}; got {events}")
+
+    def test_network_failures_identify_worker_and_request_without_leaking_exception(self):
+        for worker, error in [("xmu-account-1", requests.Timeout(SECRET)),
+                              ("xmu-account-2", requests.ConnectionError(SECRET)),
+                              ("xmu-account-3", requests.ReadTimeout(SECRET))]:
+            with self.subTest(worker=worker):
+                session = MagicMock()
+                session.put.side_effect = error
+                result, events = self.run_radar(session, worker)
+                self.assertFalse(result)
+                session.put.assert_called_once()
+                self.assert_event(events, event="exception", attempt="probe_1", phase="request",
+                                  http_status=None, exception_type=type(error).__name__, reason="request_failed")
+
+    def test_second_probe_non_json_400_is_attributed_without_response_content(self):
+        first = response({"distance": 25000}, 400)
+        second = response({}, 400)
+        second.text = SECRET
+        error = json.JSONDecodeError(SECRET, "\n" + SECRET, 2)
+        second.json.side_effect = error
+        session = MagicMock()
+        session.put.side_effect = [first, second]
+        result, events = self.run_radar(session)
+        self.assertFalse(result)
+        self.assertEqual(session.put.call_count, 2)
+        self.assert_event(events, event="http_response", attempt="probe_2", phase="response", http_status=400)
+        self.assert_event(events, event="exception", attempt="probe_2", phase="json", http_status=400,
+                          exception_type="JSONDecodeError", reason="json_decode_failed",
+                          json_line=error.lineno, json_column=error.colno)
+
+    def test_distance_validation_reports_types_without_values(self):
+        for data, json_type, distance_type, reason in [
+            ({"private": SECRET}, "dict", "missing", "missing radar distance"),
+            ([SECRET], "list", "unavailable", "missing radar distance"),
+            ({"distance": SECRET}, "dict", "str", "missing radar distance"),
+            ({"distance": None}, "dict", "NoneType", "missing radar distance"),
+            ({"distance": True}, "dict", "bool", "missing radar distance"),
+            ({"distance": float("nan")}, "dict", "float", "invalid radar distance"),
+            ({"distance": float("inf")}, "dict", "float", "invalid radar distance"),
+            ({"distance": -1}, "dict", "int", "invalid radar distance"),
+        ]:
+            with self.subTest(json_type=json_type, distance_type=distance_type, reason=reason):
+                session = MagicMock()
+                session.put.return_value = response(data, 400)
+                result, events = self.run_radar(session)
+                self.assertFalse(result)
+                session.put.assert_called_once()
+                self.assert_event(events, event="exception", attempt="probe_1", phase="distance",
+                                  http_status=400, exception_type="ValueError", reason=reason,
+                                  json_type=json_type, distance_type=distance_type)
+
+    def test_unrecognized_distance_exception_uses_fixed_reason(self):
+        session = MagicMock()
+        session.put.return_value = response({"distance": 25000}, 400)
+        with patch("xmu_rollcall.verify._distance", side_effect=ValueError(SECRET)):
+            result, events = self.run_radar(session)
+        self.assertFalse(result)
+        self.assert_event(events, event="exception", attempt="probe_1", phase="distance",
+                          http_status=400, exception_type="ValueError", reason="distance_validation_failed")
+
+    def test_no_circle_intersection_stops_before_candidate_requests(self):
+        session = MagicMock()
+        session.put.side_effect = [response({"distance": 1}, 400), response({"distance": 1}, 400)]
+        result, events = self.run_radar(session)
+        self.assertFalse(result)
+        self.assertEqual(session.put.call_count, 2)
+        self.assert_event(events, event="failed", attempt="solve", phase="geometry",
+                          http_status=None, reason="no_circle_intersection")
+
+    def test_geometry_exception_is_not_misreported_as_request_failure(self):
+        session = MagicMock()
+        session.put.side_effect = [response({"distance": 25000}, 400), response({"distance": 25000}, 400)]
+        with patch("xmu_rollcall.verify.math.sqrt", side_effect=OverflowError(SECRET)):
+            result, events = self.run_radar(session)
+        self.assertFalse(result)
+        self.assertEqual(session.put.call_count, 2)
+        self.assert_event(events, event="exception", attempt="solve", phase="geometry",
+                          http_status=None, exception_type="OverflowError", reason="geometry_failed")
+
+    def test_rejected_candidates_preserve_request_order_payloads_and_timeouts(self):
+        replies = [response({"distance": 25000}, 400), response({"distance": 25000}, 400),
+                   response({"private": SECRET}, 403), response({"private": SECRET}, 500)]
+        session = MagicMock()
+        session.put.side_effect = replies
+        with patch("xmu_rollcall.verify.uuid.uuid4", side_effect=["device-1", "device-2", "device-3", "device-4"]):
+            result, events = self.run_radar(session)
+        self.assertFalse(result)
+        self.assertEqual(session.put.call_count, 4)
+        actual_responses = [(row["attempt"], row["http_status"]) for row in events if row["event"] == "http_response"]
+        self.assertEqual(actual_responses, list(zip(ATTEMPTS, [400, 400, 403, 500])))
+        self.assert_event(events, event="failed", attempt="candidate_2", phase="response",
+                          http_status=500, reason="all_candidates_rejected")
+        coordinates = [(24.3, 118.0), (24.6, 118.2),
+                       (24.522933361048867, 117.96798398027131),
+                       (24.377066638951135, 118.23201601972869)]
+        for index, (call, (latitude, longitude)) in enumerate(zip(session.put.call_args_list, coordinates), 1):
+            self.assertEqual(call.args, ("https://lnt.xmu.edu.cn/api/rollcall/123/answer",))
+            self.assertEqual(call.kwargs["timeout"], REQUEST_TIMEOUT)
+            self.assertEqual(call.kwargs["headers"], headers)
+            payload = dict(call.kwargs["json"])
+            self.assertAlmostEqual(payload.pop("latitude"), latitude, places=10)
+            self.assertAlmostEqual(payload.pop("longitude"), longitude, places=10)
+            self.assertEqual(payload, {"accuracy": 35, "altitude": 0, "altitudeAccuracy": None,
+                                       "deviceId": f"device-{index}", "heading": None, "speed": None})
+        replies[2].json.assert_not_called()
+        replies[3].json.assert_not_called()
+
+    def test_200_at_every_attempt_returns_immediately_without_parsing_its_json(self):
+        for successful_attempt in range(4):
+            with self.subTest(attempt=ATTEMPTS[successful_attempt]):
+                replies = [response({"distance": 25000}, 400), response({"distance": 25000}, 400),
+                           response({}, 403), response({}, 500)]
+                replies[successful_attempt].status_code = 200
+                replies[successful_attempt].json.side_effect = ValueError(SECRET)
+                session = MagicMock()
+                session.put.side_effect = replies
+                result, events = self.run_radar(session)
+                self.assertTrue(result)
+                self.assertEqual(session.put.call_count, successful_attempt + 1)
+                replies[successful_attempt].json.assert_not_called()
+                self.assertFalse(any(row["event"] in {"failed", "exception"} for row in events))
+                self.assert_event(events, event="http_response", attempt=ATTEMPTS[successful_attempt],
+                                  phase="response", http_status=200)
+
+
+if __name__ == "__main__":
+    unittest.main()

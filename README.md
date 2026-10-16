@@ -81,6 +81,17 @@ IDs, and unavailable codes block submission. Counts and allow decisions are neve
 Classes with fewer than 10 other students cannot pass the threshold. QR scanning
 and success notifications retain their existing behavior; waiting reasons are logged.
 
+Radar submission emits `[Radar]` JSON diagnostics with the rollcall ID, account
+worker (for example `xmu-account-1`), probe/candidate attempt, processing phase, and
+HTTP status (`null` when no response arrived). Exceptions include their concrete
+type and a fixed reason; JSON errors include line/column, and distance errors
+include field types. Request errors, malformed JSON, missing/invalid distance,
+non-intersecting circles, and rejected candidates can be distinguished without
+logging raw exception text, response bodies, cookies, device IDs, or coordinates.
+Non-200 probe responses may carry valid distances; check subsequent `exception`
+or `failed` events before treating them as failures. Request sequence, payloads,
+timeouts, success decisions, and attendance thresholds are unchanged.
+
 ## Multi-Account Monitoring
 
 Accounts are stored in the same local config file. Add several accounts with:
