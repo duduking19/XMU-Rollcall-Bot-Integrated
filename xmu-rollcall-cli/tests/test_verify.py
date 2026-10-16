@@ -47,13 +47,13 @@ class AnswerSubmissionTest(unittest.TestCase):
                 session = MagicMock()
                 session.put.return_value = response(data, status=400)
                 self.assertFalse(send_radar(session, 123))
-                self.assertEqual(session.put.call_count, 3)
+                self.assertEqual(session.put.call_count, 4)
                 session.put.return_value.json.assert_called_once()
         for error in (requests.Timeout(), ValueError()):
             session = MagicMock()
             session.put.side_effect = error
             self.assertFalse(send_radar(session, 123))
-            self.assertEqual(session.put.call_count, 3)
+            self.assertEqual(session.put.call_count, 4)
 
     def test_radar_all_attempts_have_timeouts(self):
         session = MagicMock()

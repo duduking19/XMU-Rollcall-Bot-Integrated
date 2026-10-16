@@ -39,7 +39,7 @@ class RadarDiagnosticsTest(unittest.TestCase):
         for event in events:
             self.assertEqual(event["rollcall_id"], 123)
             self.assertEqual(event["worker"], worker)
-            self.assertIn(event["attempt"], ATTEMPTS + ["solve", "fixed_1", "fixed_2"])
+            self.assertIn(event["attempt"], ATTEMPTS + ["solve", "fixed_1", "fixed_2", "fixed_3"])
             self.assertIn(event["phase"], {"request", "json", "distance", "response", "geometry"})
             self.assertIn(event["event"], {"http_response", "exception", "failed", "fallback_start", "success"})
             self.assertIn("http_status", event)
@@ -61,7 +61,7 @@ class RadarDiagnosticsTest(unittest.TestCase):
                 session.put.side_effect = error
                 result, events = self.run_radar(session, worker)
                 self.assertFalse(result)
-                self.assertEqual(session.put.call_count, 3)
+                self.assertEqual(session.put.call_count, 4)
                 self.assert_event(events, event="exception", attempt="probe_1", phase="request",
                                   http_status=None, exception_type=type(error).__name__, reason="request_failed")
 
@@ -72,10 +72,10 @@ class RadarDiagnosticsTest(unittest.TestCase):
         error = json.JSONDecodeError(SECRET, "\n" + SECRET, 2)
         second.json.side_effect = error
         session = MagicMock()
-        session.put.side_effect = [first, second, response({}, 403), response({}, 500)]
+        session.put.side_effect = [first, second, response({}, 403), response({}, 500), response({}, 403)]
         result, events = self.run_radar(session)
         self.assertFalse(result)
-        self.assertEqual(session.put.call_count, 4)
+        self.assertEqual(session.put.call_count, 5)
         self.assert_event(events, event="http_response", attempt="probe_2", phase="response", http_status=400)
         self.assert_event(events, event="exception", attempt="probe_2", phase="json", http_status=400,
                           exception_type="JSONDecodeError", reason="json_decode_failed",
@@ -97,7 +97,7 @@ class RadarDiagnosticsTest(unittest.TestCase):
                 session.put.return_value = response(data, 400)
                 result, events = self.run_radar(session)
                 self.assertFalse(result)
-                self.assertEqual(session.put.call_count, 3)
+                self.assertEqual(session.put.call_count, 4)
                 session.put.return_value.json.assert_called_once()
                 self.assert_event(events, event="exception", attempt="probe_1", phase="distance",
                                   http_status=400, exception_type="ValueError", reason=reason,
@@ -109,17 +109,17 @@ class RadarDiagnosticsTest(unittest.TestCase):
         with patch("xmu_rollcall.verify._distance", side_effect=ValueError(SECRET)):
             result, events = self.run_radar(session)
         self.assertFalse(result)
-        self.assertEqual(session.put.call_count, 3)
+        self.assertEqual(session.put.call_count, 4)
         self.assert_event(events, event="exception", attempt="probe_1", phase="distance",
                           http_status=400, exception_type="ValueError", reason="distance_validation_failed")
 
     def test_no_circle_intersection_stops_before_candidate_requests(self):
         session = MagicMock()
         session.put.side_effect = [response({"distance": 1}, 400), response({"distance": 1}, 400),
-                                   response({}, 403), response({}, 500)]
+                                   response({}, 403), response({}, 500), response({}, 403)]
         result, events = self.run_radar(session)
         self.assertFalse(result)
-        self.assertEqual(session.put.call_count, 4)
+        self.assertEqual(session.put.call_count, 5)
         self.assertFalse(any(row.get("attempt", "").startswith("candidate_") for row in events))
         self.assert_event(events, event="failed", attempt="solve", phase="geometry",
                           http_status=None, reason="no_circle_intersection")
@@ -127,32 +127,34 @@ class RadarDiagnosticsTest(unittest.TestCase):
     def test_geometry_exception_is_not_misreported_as_request_failure(self):
         session = MagicMock()
         session.put.side_effect = [response({"distance": 25000}, 400), response({"distance": 25000}, 400),
-                                   response({}, 403), response({}, 500)]
+                                   response({}, 403), response({}, 500), response({}, 403)]
         with patch("xmu_rollcall.verify.math.sqrt", side_effect=OverflowError(SECRET)):
             result, events = self.run_radar(session)
         self.assertFalse(result)
-        self.assertEqual(session.put.call_count, 4)
+        self.assertEqual(session.put.call_count, 5)
         self.assert_event(events, event="exception", attempt="solve", phase="geometry",
                           http_status=None, exception_type="OverflowError", reason="geometry_failed")
 
     def test_rejected_candidates_preserve_request_order_payloads_and_timeouts(self):
         replies = [response({"distance": 25000}, 400), response({"distance": 25000}, 400),
                    response({"private": SECRET}, 403), response({"private": SECRET}, 500),
-                   response({"private": SECRET}, 403), response({"private": SECRET}, 500)]
+                   response({"private": SECRET}, 403), response({"private": SECRET}, 500),
+                   response({"private": SECRET}, 403)]
         session = MagicMock()
         session.put.side_effect = replies
-        with patch("xmu_rollcall.verify.uuid.uuid4", side_effect=[f"device-{i}" for i in range(1, 7)]):
+        with patch("xmu_rollcall.verify.uuid.uuid4", side_effect=[f"device-{i}" for i in range(1, 8)]):
             result, events = self.run_radar(session)
         self.assertFalse(result)
-        self.assertEqual(session.put.call_count, 6)
+        self.assertEqual(session.put.call_count, 7)
         actual_responses = [(row["attempt"], row["http_status"]) for row in events if row["event"] == "http_response"]
-        self.assertEqual(actual_responses, list(zip(ATTEMPTS + ["fixed_1", "fixed_2"], [400, 400, 403, 500, 403, 500])))
+        self.assertEqual(actual_responses, list(zip(ATTEMPTS + ["fixed_1", "fixed_2", "fixed_3"],
+                                                   [400, 400, 403, 500, 403, 500, 403])))
         self.assert_event(events, event="failed", attempt="candidate_2", phase="response",
                           http_status=500, reason="all_candidates_rejected")
         coordinates = [(24.3, 118.0), (24.6, 118.2),
                        (24.522933361048867, 117.96798398027131),
                        (24.377066638951135, 118.23201601972869),
-                       (24.6082, 118.2953), (24.6087, 118.3090)]
+                       (24.6082, 118.2953), (24.6087, 118.3090), (24.6075, 118.2950)]
         for index, (call, (latitude, longitude)) in enumerate(zip(session.put.call_args_list, coordinates), 1):
             self.assertEqual(call.args, ("https://lnt.xmu.edu.cn/api/rollcall/123/answer",))
             self.assertEqual(call.kwargs["timeout"], REQUEST_TIMEOUT)

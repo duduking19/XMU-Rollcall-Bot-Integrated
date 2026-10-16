@@ -83,11 +83,12 @@ and success notifications retain their existing behavior; waiting reasons are lo
 
 Radar submissions first try the existing distance probes and circle intersections.
 If that method fails (including request/JSON errors, missing or invalid distance,
-no intersections, or both candidates being rejected), they try two fixed locations
+no intersections, or both candidates being rejected), they try three fixed locations
 in order: **latitude 24.6082, longitude 118.2953**, then **latitude 24.6087,
-longitude 118.3090**. The supplied four decimal places are retained. Fixed-location
+longitude 118.3090**, then **latitude 24.6075, longitude 118.2950** (converted from
+24°36′27″ N, 118°17′42″ E). Four decimal places are retained. Fixed-location
 responses do not need a distance field. Any HTTP 200 ends the attempt immediately;
-each round adds at most two fixed-location requests, for at most six requests total.
+each round adds at most three fixed-location requests, for at most seven requests total.
 A failed fixed-location request does not prevent trying the next location. The
 attendance threshold, request payload fields/timeouts, and polling retries stay the same.
 
@@ -100,8 +101,8 @@ non-intersecting circles, and rejected candidates can be distinguished without
 logging raw exception text, response bodies, cookies, device IDs, or coordinates.
 Non-200 probe responses may carry valid distances; check subsequent `exception`
 or `failed` events before treating them as failures. A `fallback_start` event marks
-the switch to fixed locations; `fixed_1` and `fixed_2` identify those requests, with
-`success` on a fixed-location HTTP 200 or `all_fixed_locations_rejected` if both fail.
+the switch to fixed locations; `fixed_1`, `fixed_2`, and `fixed_3` identify those requests,
+with `success` on a fixed-location HTTP 200 or `all_fixed_locations_rejected` if all fail.
 
 ## Multi-Account Monitoring
 

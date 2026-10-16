@@ -19,7 +19,11 @@ headers = {
 }
 
 # (latitude, longitude), in fallback order; retain the supplied four decimal places.
-RADAR_FALLBACK_LOCATIONS = ((24.6082, 118.2953), (24.6087, 118.3090))
+RADAR_FALLBACK_LOCATIONS = (
+    (24.6082, 118.2953),
+    (24.6087, 118.3090),
+    (24.6075, 118.2950),  # 24°36′27″ N, 118°17′42″ E.
+)
 
 def send_code(in_session, rollcall_id, number_code):
     """Submit only the exact code selected by the attendance guard."""
